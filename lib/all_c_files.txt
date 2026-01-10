@@ -1,0 +1,3283 @@
+===== bus.c =====  
+#include <bus.h>
+#include <cart.h>
+#include <ram.h>
+#include <cpu.h>
+#include <io.h>
+#include <ppu.h>
+#include <dma.h>
+
+// 0x0000 - 0x3FFF : ROM Bank 0
+// 0x4000 - 0x7FFF : ROM Bank 1 - Switchable
+// 0x8000 - 0x97FF : CHR RAM
+// 0x9800 - 0x9BFF : BG Map 1
+// 0x9C00 - 0x9FFF : BG Map 2
+// 0xA000 - 0xBFFF : Cartridge RAM
+// 0xC000 - 0xCFFF : RAM Bank 0
+// 0xD000 - 0xDFFF : RAM Bank 1-7 - switchable - Color only
+// 0xE000 - 0xFDFF : Reserved - Echo RAM
+// 0xFE00 - 0xFE9F : Object Attribute Memory
+// 0xFEA0 - 0xFEFF : Reserved - Unusable
+// 0xFF00 - 0xFF7F : I/O Registers
+// 0xFF80 - 0xFFFE : Zero Page
+
+u8 bus_read(u16 address) {
+    if (address < 0x8000) {
+        //ROM Data
+        return cart_read(address);
+    } else if (address < 0xA000) {
+        //Char/Map Data
+        return ppu_vram_read(address);
+    } else if (address < 0xC000) {
+        //Cartridge RAM
+        return cart_read(address);
+    } else if (address < 0xE000) {
+        //WRAM (Working RAM)
+        return wram_read(address);
+    } else if (address < 0xFE00) {
+        //reserved echo ram...
+        return 0;
+    } else if (address < 0xFEA0) {
+        //OAM
+        if (dma_transferring()) {
+            return 0xFF;
+        }
+
+        return ppu_oam_read(address);
+    } else if (address < 0xFF00) {
+        //reserved unusable...
+        return 0;
+    } else if (address < 0xFF80) {
+        //IO Registers...
+        return io_read(address);
+    } else if (address == 0xFFFF) {
+        //CPU ENABLE REGISTER...
+        return cpu_get_ie_register();
+    }
+
+    //NO_IMPL
+    return hram_read(address);
+}
+
+void bus_write(u16 address, u8 value) {
+    if (address < 0x8000) {
+        //ROM Data
+        cart_write(address, value);
+    } else if (address < 0xA000) {
+        //Char/Map Data
+        ppu_vram_write(address, value);
+    } else if (address < 0xC000) {
+        //EXT-RAM
+        cart_write(address, value);
+    } else if (address < 0xE000) {
+        //WRAM
+        wram_write(address, value);
+    } else if (address < 0xFE00) {
+        //reserved echo ram
+    } else if (address < 0xFEA0) {
+        //OAM
+        if (dma_transferring()) {
+            return;
+        }
+        
+        ppu_oam_write(address, value);
+    } else if (address < 0xFF00) {
+        //unusable reserved
+    } else if (address < 0xFF80) {
+        //IO Registers...
+        io_write(address, value);
+    } else if (address == 0xFFFF) {
+        //CPU SET ENABLE REGISTER
+        
+        cpu_set_ie_register(value);
+    } else {
+        hram_write(address, value);
+    }
+}
+
+u16 bus_read16(u16 address) {
+    u16 lo = bus_read(address);
+    u16 hi = bus_read(address + 1);
+
+    return lo | (hi << 8);
+}
+
+void bus_write16(u16 address, u16 value) {
+    bus_write(address + 1, (value >> 8) & 0xFF);
+    bus_write(address, value & 0xFF);
+}
+===== cart.c =====  
+#include <cart.h>
+#include <string.h>
+
+typedef struct {
+    char filename[1024];
+    u32 rom_size;
+    u8 *rom_data;
+    rom_header *header;
+
+    //mbc1 related data
+    bool ram_enabled;
+    bool ram_banking;
+
+    u8 *rom_bank_x;
+    u8 banking_mode;
+
+    u8 rom_bank_value;
+    u8 ram_bank_value;
+
+    u8 *ram_bank; //current selected ram bank
+    u8 *ram_banks[16]; //all ram banks
+
+    //for battery
+    bool battery; //has battery
+    bool need_save; //should save battery backup.
+} cart_context;
+
+static cart_context ctx;
+
+bool cart_need_save() {
+    return ctx.need_save;
+}
+
+bool cart_mbc1() {
+    return BETWEEN(ctx.header->type, 1, 3);
+}
+
+bool cart_battery() {
+    //mbc1 only for now...
+    return ctx.header->type == 3;
+}
+
+static const char *ROM_TYPES[] = {
+    "ROM ONLY",
+    "MBC1",
+    "MBC1+RAM",
+    "MBC1+RAM+BATTERY",
+    "0x04 ???",
+    "MBC2",
+    "MBC2+BATTERY",
+    "0x07 ???",
+    "ROM+RAM 1",
+    "ROM+RAM+BATTERY 1",
+    "0x0A ???",
+    "MMM01",
+    "MMM01+RAM",
+    "MMM01+RAM+BATTERY",
+    "0x0E ???",
+    "MBC3+TIMER+BATTERY",
+    "MBC3+TIMER+RAM+BATTERY 2",
+    "MBC3",
+    "MBC3+RAM 2",
+    "MBC3+RAM+BATTERY 2",
+    "0x14 ???",
+    "0x15 ???",
+    "0x16 ???",
+    "0x17 ???",
+    "0x18 ???",
+    "MBC5",
+    "MBC5+RAM",
+    "MBC5+RAM+BATTERY",
+    "MBC5+RUMBLE",
+    "MBC5+RUMBLE+RAM",
+    "MBC5+RUMBLE+RAM+BATTERY",
+    "0x1F ???",
+    "MBC6",
+    "0x21 ???",
+    "MBC7+SENSOR+RUMBLE+RAM+BATTERY",
+};
+
+static const char *LIC_CODE[0xA5] = {
+    [0x00] = "None",
+    [0x01] = "Nintendo R&D1",
+    [0x08] = "Capcom",
+    [0x13] = "Electronic Arts",
+    [0x18] = "Hudson Soft",
+    [0x19] = "b-ai",
+    [0x20] = "kss",
+    [0x22] = "pow",
+    [0x24] = "PCM Complete",
+    [0x25] = "san-x",
+    [0x28] = "Kemco Japan",
+    [0x29] = "seta",
+    [0x30] = "Viacom",
+    [0x31] = "Nintendo",
+    [0x32] = "Bandai",
+    [0x33] = "Ocean/Acclaim",
+    [0x34] = "Konami",
+    [0x35] = "Hector",
+    [0x37] = "Taito",
+    [0x38] = "Hudson",
+    [0x39] = "Banpresto",
+    [0x41] = "Ubi Soft",
+    [0x42] = "Atlus",
+    [0x44] = "Malibu",
+    [0x46] = "angel",
+    [0x47] = "Bullet-Proof",
+    [0x49] = "irem",
+    [0x50] = "Absolute",
+    [0x51] = "Acclaim",
+    [0x52] = "Activision",
+    [0x53] = "American sammy",
+    [0x54] = "Konami",
+    [0x55] = "Hi tech entertainment",
+    [0x56] = "LJN",
+    [0x57] = "Matchbox",
+    [0x58] = "Mattel",
+    [0x59] = "Milton Bradley",
+    [0x60] = "Titus",
+    [0x61] = "Virgin",
+    [0x64] = "LucasArts",
+    [0x67] = "Ocean",
+    [0x69] = "Electronic Arts",
+    [0x70] = "Infogrames",
+    [0x71] = "Interplay",
+    [0x72] = "Broderbund",
+    [0x73] = "sculptured",
+    [0x75] = "sci",
+    [0x78] = "THQ",
+    [0x79] = "Accolade",
+    [0x80] = "misawa",
+    [0x83] = "lozc",
+    [0x86] = "Tokuma Shoten Intermedia",
+    [0x87] = "Tsukuda Original",
+    [0x91] = "Chunsoft",
+    [0x92] = "Video system",
+    [0x93] = "Ocean/Acclaim",
+    [0x95] = "Varie",
+    [0x96] = "Yonezawa/s’pal",
+    [0x97] = "Kaneko",
+    [0x99] = "Pack in soft",
+    [0xA4] = "Konami (Yu-Gi-Oh!)"
+};
+
+const char *cart_lic_name() {
+    if (ctx.header->new_lic_code <= 0xA4) {
+        return LIC_CODE[ctx.header->lic_code];
+    }
+
+    return "UNKNOWN";
+}
+
+const char *cart_type_name() {
+    if (ctx.header->type <= 0x22) {
+        return ROM_TYPES[ctx.header->type];
+    }
+
+    return "UNKNOWN";
+}
+
+void cart_setup_banking() {
+    for (int i=0; i<16; i++) {
+        ctx.ram_banks[i] = 0;
+
+        if ((ctx.header->ram_size == 2 && i == 0) ||
+            (ctx.header->ram_size == 3 && i < 4) || 
+            (ctx.header->ram_size == 4 && i < 16) || 
+            (ctx.header->ram_size == 5 && i < 8)) {
+            ctx.ram_banks[i] = malloc(0x2000);
+            memset(ctx.ram_banks[i], 0, 0x2000);
+        }
+    }
+
+    ctx.ram_bank = ctx.ram_banks[0];
+    ctx.rom_bank_x = ctx.rom_data + 0x4000; //rom bank 1
+}
+
+bool cart_load(char *cart) {
+    snprintf(ctx.filename, sizeof(ctx.filename), "%s", cart);
+
+    FILE *fp = fopen(cart, "r");
+
+    if (!fp) {
+        printf("Failed to open: %s\n", cart);
+        return false;
+    }
+
+    printf("Opened: %s\n", ctx.filename);
+
+    fseek(fp, 0, SEEK_END);
+    ctx.rom_size = ftell(fp);
+
+    rewind(fp);
+
+    ctx.rom_data = malloc(ctx.rom_size);
+    fread(ctx.rom_data, ctx.rom_size, 1, fp);
+    fclose(fp);
+
+    ctx.header = (rom_header *)(ctx.rom_data + 0x100);
+    ctx.header->title[15] = 0;
+    ctx.battery = cart_battery();
+    ctx.need_save = false;
+
+    printf("Cartridge Loaded:\n");
+    printf("\t Title    : %s\n", ctx.header->title);
+    printf("\t Type     : %2.2X (%s)\n", ctx.header->type, cart_type_name());
+    printf("\t ROM Size : %d KB\n", 32 << ctx.header->rom_size);
+    printf("\t RAM Size : %2.2X\n", ctx.header->ram_size);
+    printf("\t LIC Code : %2.2X (%s)\n", ctx.header->lic_code, cart_lic_name());
+    printf("\t ROM Vers : %2.2X\n", ctx.header->version);
+
+    cart_setup_banking();
+
+    u16 x = 0;
+    for (u16 i=0x0134; i<=0x014C; i++) {
+        x = x - ctx.rom_data[i] - 1;
+    }
+
+    printf("\t Checksum : %2.2X (%s)\n", ctx.header->checksum, (x & 0xFF) ? "PASSED" : "FAILED");
+
+    if (ctx.battery) {
+        cart_battery_load();
+    }
+
+    return true;
+}
+
+void cart_battery_load() {
+    if (!ctx.ram_bank) {
+        return;
+    }
+
+    char fn[1048];
+    sprintf(fn, "%s.battery", ctx.filename);
+    FILE *fp = fopen(fn, "rb");
+
+    if (!fp) {
+        fprintf(stderr, "FAILED TO OPEN: %s\n", fn);
+        return;
+    }
+
+    fread(ctx.ram_bank, 0x2000, 1, fp);
+    fclose(fp);
+}
+
+void cart_battery_save() {
+    if (!ctx.ram_bank) {
+        return;
+    }
+
+    char fn[1048];
+    sprintf(fn, "%s.battery", ctx.filename);
+    FILE *fp = fopen(fn, "wb");
+
+    if (!fp) {
+        fprintf(stderr, "FAILED TO OPEN: %s\n", fn);
+        return;
+    }
+
+    fwrite(ctx.ram_bank, 0x2000, 1, fp);
+    fclose(fp);
+}
+
+u8 cart_read(u16 address) {
+    if (!cart_mbc1() || address < 0x4000) {
+        return ctx.rom_data[address];
+    }
+
+    if ((address & 0xE000) == 0xA000) {
+        if (!ctx.ram_enabled) {
+            return 0xFF;
+        }
+
+        if (!ctx.ram_bank) {
+            return 0xFF;
+        }
+
+        return ctx.ram_bank[address - 0xA000];
+    }
+
+    return ctx.rom_bank_x[address - 0x4000];
+}
+
+void cart_write(u16 address, u8 value) {
+    if (!cart_mbc1()) {
+        return;
+    }
+
+    if (address < 0x2000) {
+        ctx.ram_enabled = ((value & 0xF) == 0xA);
+    }
+
+    if ((address & 0xE000) == 0x2000) {
+        //rom bank number
+        if (value == 0) {
+            value = 1;
+        }
+
+        value &= 0b11111;
+
+        ctx.rom_bank_value = value;
+        ctx.rom_bank_x = ctx.rom_data + (0x4000 * ctx.rom_bank_value);
+    }
+
+    if ((address & 0xE000) == 0x4000) {
+        //ram bank number
+        ctx.ram_bank_value = value & 0b11;
+
+        if (ctx.ram_banking) {
+            if (cart_need_save()) {
+                cart_battery_save();
+            }
+
+            ctx.ram_bank = ctx.ram_banks[ctx.ram_bank_value];
+        }
+    }
+
+    if ((address & 0xE000) == 0x6000) {
+        //banking mode select
+        ctx.banking_mode = value & 1;
+
+        ctx.ram_banking = ctx.banking_mode;
+
+        if (ctx.ram_banking) {
+            if (cart_need_save()) {
+                cart_battery_save();
+            }
+            
+            ctx.ram_bank = ctx.ram_banks[ctx.ram_bank_value];
+        }
+    }
+
+    if ((address & 0xE000) == 0xA000) {
+        if (!ctx.ram_enabled) {
+            return;
+        }
+
+        if (!ctx.ram_bank) {
+            return;
+        }
+
+        ctx.ram_bank[address - 0xA000] = value;
+
+        if (ctx.battery) {
+            ctx.need_save = true;
+        }
+    }
+}
+
+===== cpu.c =====  
+#include <cpu.h>
+#include <bus.h>
+#include <emu.h>
+#include <interrupts.h>
+#include <dbg.h>
+#include <timer.h>
+
+cpu_context ctx = {0};
+
+#define CPU_DEBUG 0
+
+void cpu_init() {
+    ctx.regs.pc = 0x100;
+    ctx.regs.sp = 0xFFFE;
+    *((short *)&ctx.regs.a) = 0xB001;
+    *((short *)&ctx.regs.b) = 0x1300;
+    *((short *)&ctx.regs.d) = 0xD800;
+    *((short *)&ctx.regs.h) = 0x4D01;
+    ctx.ie_register = 0;
+    ctx.int_flags = 0;
+    ctx.int_master_enabled = false;
+    ctx.enabling_ime = false;
+
+    timer_get_context()->div = 0xABCC;
+}
+
+static void fetch_instruction() {
+    ctx.cur_opcode = bus_read(ctx.regs.pc++);
+    ctx.cur_inst = instruction_by_opcode(ctx.cur_opcode);
+}
+
+void fetch_data();
+
+static void execute() {
+    IN_PROC proc = inst_get_processor(ctx.cur_inst->type);
+
+    if (!proc) {
+        NO_IMPL
+    }
+
+    proc(&ctx);
+}
+
+bool cpu_step() {
+    
+    if (!ctx.halted) {
+        u16 pc = ctx.regs.pc;
+
+        fetch_instruction();
+        emu_cycles(1);
+        fetch_data();
+
+#if CPU_DEBUG == 1
+        char flags[16];
+        sprintf(flags, "%c%c%c%c", 
+            ctx.regs.f & (1 << 7) ? 'Z' : '-',
+            ctx.regs.f & (1 << 6) ? 'N' : '-',
+            ctx.regs.f & (1 << 5) ? 'H' : '-',
+            ctx.regs.f & (1 << 4) ? 'C' : '-'
+        );
+
+        char inst[16];
+        inst_to_str(&ctx, inst);
+
+        printf("%08lX - %04X: %-12s (%02X %02X %02X) A: %02X F: %s BC: %02X%02X DE: %02X%02X HL: %02X%02X\n", 
+            emu_get_context()->ticks,
+            pc, inst, ctx.cur_opcode,
+            bus_read(pc + 1), bus_read(pc + 2), ctx.regs.a, flags, ctx.regs.b, ctx.regs.c,
+            ctx.regs.d, ctx.regs.e, ctx.regs.h, ctx.regs.l);
+#endif
+
+        if (ctx.cur_inst == NULL) {
+            printf("Unknown Instruction! %02X\n", ctx.cur_opcode);
+            exit(-7);
+        }
+
+        dbg_update();
+        dbg_print();
+
+        execute();
+    } else {
+        //is halted...
+        emu_cycles(1);
+
+        if (ctx.int_flags) {
+            ctx.halted = false;
+        }
+    }
+
+    if (ctx.int_master_enabled) {
+        cpu_handle_interrupts(&ctx);
+        ctx.enabling_ime = false;
+    }
+
+    if (ctx.enabling_ime) {
+        ctx.int_master_enabled = true;
+    }
+
+    return true;
+}
+
+u8 cpu_get_ie_register() {
+    return ctx.ie_register;
+}
+
+void cpu_set_ie_register(u8 n) {
+    ctx.ie_register = n;
+}
+
+void cpu_request_interrupt(interrupt_type t) {
+    ctx.int_flags |= t;
+}
+===== cpu_fetch.c =====  
+#include <cpu.h>
+#include <bus.h>
+#include <emu.h>
+
+extern cpu_context ctx;
+
+void fetch_data() {
+    ctx.mem_dest = 0;
+    ctx.dest_is_mem = false;
+    
+    if (ctx.cur_inst == NULL) {
+        return;
+    }
+
+    switch(ctx.cur_inst->mode) {
+        case AM_IMP: return;
+
+        case AM_R:
+            ctx.fetched_data = cpu_read_reg(ctx.cur_inst->reg_1);
+            return;
+
+        case AM_R_R:
+            ctx.fetched_data = cpu_read_reg(ctx.cur_inst->reg_2);
+            return;
+
+        case AM_R_D8:
+            ctx.fetched_data = bus_read(ctx.regs.pc);
+            emu_cycles(1);
+            ctx.regs.pc++;
+            return;
+
+        case AM_R_D16:
+        case AM_D16: {
+            u16 lo = bus_read(ctx.regs.pc);
+            emu_cycles(1);
+
+            u16 hi = bus_read(ctx.regs.pc + 1);
+            emu_cycles(1);
+
+            ctx.fetched_data = lo | (hi << 8);
+
+            ctx.regs.pc += 2;
+
+            return;
+        }
+
+        case AM_MR_R:
+            ctx.fetched_data = cpu_read_reg(ctx.cur_inst->reg_2);
+            ctx.mem_dest = cpu_read_reg(ctx.cur_inst->reg_1);
+            ctx.dest_is_mem = true;
+
+            if (ctx.cur_inst->reg_1 == RT_C) {
+                ctx.mem_dest |= 0xFF00;
+            }
+
+            return;
+
+        case AM_R_MR: {
+            u16 addr = cpu_read_reg(ctx.cur_inst->reg_2);
+
+            if (ctx.cur_inst->reg_2 == RT_C) {
+                addr |= 0xFF00;
+            }
+
+            ctx.fetched_data = bus_read(addr);
+            emu_cycles(1);
+
+        } return;
+
+        case AM_R_HLI:
+            ctx.fetched_data = bus_read(cpu_read_reg(ctx.cur_inst->reg_2));
+            emu_cycles(1);
+            cpu_set_reg(RT_HL, cpu_read_reg(RT_HL) + 1);
+            return;
+
+        case AM_R_HLD:
+            ctx.fetched_data = bus_read(cpu_read_reg(ctx.cur_inst->reg_2));
+            emu_cycles(1);
+            cpu_set_reg(RT_HL, cpu_read_reg(RT_HL) - 1);
+            return;
+
+        case AM_HLI_R:
+            ctx.fetched_data = cpu_read_reg(ctx.cur_inst->reg_2);
+            ctx.mem_dest = cpu_read_reg(ctx.cur_inst->reg_1);
+            ctx.dest_is_mem = true;
+            cpu_set_reg(RT_HL, cpu_read_reg(RT_HL) + 1);
+            return;
+
+        case AM_HLD_R:
+            ctx.fetched_data = cpu_read_reg(ctx.cur_inst->reg_2);
+            ctx.mem_dest = cpu_read_reg(ctx.cur_inst->reg_1);
+            ctx.dest_is_mem = true;
+            cpu_set_reg(RT_HL, cpu_read_reg(RT_HL) - 1);
+            return;
+
+        case AM_R_A8:
+            ctx.fetched_data = bus_read(ctx.regs.pc);
+            emu_cycles(1);
+            ctx.regs.pc++;
+            return;
+
+        case AM_A8_R:
+            ctx.mem_dest = bus_read(ctx.regs.pc) | 0xFF00;
+            ctx.dest_is_mem = true;
+            emu_cycles(1);
+            ctx.regs.pc++;
+            return;
+
+        case AM_HL_SPR:
+            ctx.fetched_data = bus_read(ctx.regs.pc);
+            emu_cycles(1);
+            ctx.regs.pc++;
+            return;
+
+        case AM_D8:
+            ctx.fetched_data = bus_read(ctx.regs.pc);
+            emu_cycles(1);
+            ctx.regs.pc++;
+            return;
+
+        case AM_A16_R:
+        case AM_D16_R: {
+            u16 lo = bus_read(ctx.regs.pc);
+            emu_cycles(1);
+
+            u16 hi = bus_read(ctx.regs.pc + 1);
+            emu_cycles(1);
+
+            ctx.mem_dest = lo | (hi << 8);
+            ctx.dest_is_mem = true;
+
+            ctx.regs.pc += 2;
+            ctx.fetched_data = cpu_read_reg(ctx.cur_inst->reg_2);
+
+        } return;
+
+        case AM_MR_D8:
+            ctx.fetched_data = bus_read(ctx.regs.pc);
+            emu_cycles(1);
+            ctx.regs.pc++;
+            ctx.mem_dest = cpu_read_reg(ctx.cur_inst->reg_1);
+            ctx.dest_is_mem = true;
+            return;
+
+        case AM_MR:
+            ctx.mem_dest = cpu_read_reg(ctx.cur_inst->reg_1);
+            ctx.dest_is_mem = true;
+            ctx.fetched_data = bus_read(cpu_read_reg(ctx.cur_inst->reg_1));
+            emu_cycles(1);
+            return;
+
+        case AM_R_A16: {
+            u16 lo = bus_read(ctx.regs.pc);
+            emu_cycles(1);
+
+            u16 hi = bus_read(ctx.regs.pc + 1);
+            emu_cycles(1);
+
+            u16 addr = lo | (hi << 8);
+
+            ctx.regs.pc += 2;
+            ctx.fetched_data = bus_read(addr);
+            emu_cycles(1);
+
+            return;
+        }
+
+        default:
+            printf("Unknown Addressing Mode! %d (%02X)\n", ctx.cur_inst->mode, ctx.cur_opcode);
+            exit(-7);
+            return;
+    }
+}===== cpu_proc.c =====  
+#include <cpu.h>
+#include <emu.h>
+#include <bus.h>
+#include <stack.h>
+
+//processes CPU instructions...
+
+void cpu_set_flags(cpu_context *ctx, int8_t z, int8_t n, int8_t h, int8_t c) {
+    if (z != -1) {
+        BIT_SET(ctx->regs.f, 7, z);
+    }
+
+    if (n != -1) {
+        BIT_SET(ctx->regs.f, 6, n);
+    }
+
+    if (h != -1) {
+        BIT_SET(ctx->regs.f, 5, h);
+    }
+
+    if (c != -1) {
+        BIT_SET(ctx->regs.f, 4, c);
+    }
+}
+
+static void proc_none(cpu_context *ctx) {
+    printf("INVALID INSTRUCTION!\n");
+    exit(-7);
+}
+
+static void proc_nop(cpu_context *ctx) {
+
+}
+
+reg_type rt_lookup[] = {
+    RT_B,
+    RT_C,
+    RT_D,
+    RT_E,
+    RT_H,
+    RT_L,
+    RT_HL,
+    RT_A
+};
+
+reg_type decode_reg(u8 reg) {
+    if (reg > 0b111) {
+        return RT_NONE;
+    }
+
+    return rt_lookup[reg];
+}
+
+static void proc_cb(cpu_context *ctx) {
+    u8 op = ctx->fetched_data;
+    reg_type reg = decode_reg(op & 0b111);
+    u8 bit = (op >> 3) & 0b111;
+    u8 bit_op = (op >> 6) & 0b11;
+    u8 reg_val = cpu_read_reg8(reg);
+
+    emu_cycles(1);
+
+    if (reg == RT_HL) {
+        emu_cycles(2);
+    }
+
+    switch(bit_op) {
+        case 1:
+            //BIT
+            cpu_set_flags(ctx, !(reg_val & (1 << bit)), 0, 1, -1);
+            return;
+
+        case 2:
+            //RST
+            reg_val &= ~(1 << bit);
+            cpu_set_reg8(reg, reg_val);
+            return;
+
+        case 3:
+            //SET
+            reg_val |= (1 << bit);
+            cpu_set_reg8(reg, reg_val);
+            return;
+    }
+
+    bool flagC = CPU_FLAG_C;
+
+    switch(bit) {
+        case 0: {
+            //RLC
+            bool setC = false;
+            u8 result = (reg_val << 1) & 0xFF;
+
+            if ((reg_val & (1 << 7)) != 0) {
+                result |= 1;
+                setC = true;
+            }
+
+            cpu_set_reg8(reg, result);
+            cpu_set_flags(ctx, result == 0, false, false, setC);
+        } return;
+
+        case 1: {
+            //RRC
+            u8 old = reg_val;
+            reg_val >>= 1;
+            reg_val |= (old << 7);
+
+            cpu_set_reg8(reg, reg_val);
+            cpu_set_flags(ctx, !reg_val, false, false, old & 1);
+        } return;
+
+        case 2: {
+            //RL
+            u8 old = reg_val;
+            reg_val <<= 1;
+            reg_val |= flagC;
+
+            cpu_set_reg8(reg, reg_val);
+            cpu_set_flags(ctx, !reg_val, false, false, !!(old & 0x80));
+        } return;
+
+        case 3: {
+            //RR
+            u8 old = reg_val;
+            reg_val >>= 1;
+
+            reg_val |= (flagC << 7);
+
+            cpu_set_reg8(reg, reg_val);
+            cpu_set_flags(ctx, !reg_val, false, false, old & 1);
+        } return;
+
+        case 4: {
+            //SLA
+            u8 old = reg_val;
+            reg_val <<= 1;
+
+            cpu_set_reg8(reg, reg_val);
+            cpu_set_flags(ctx, !reg_val, false, false, !!(old & 0x80));
+        } return;
+
+        case 5: {
+            //SRA
+            u8 u = (int8_t)reg_val >> 1;
+            cpu_set_reg8(reg, u);
+            cpu_set_flags(ctx, !u, 0, 0, reg_val & 1);
+        } return;
+
+        case 6: {
+            //SWAP
+            reg_val = ((reg_val & 0xF0) >> 4) | ((reg_val & 0xF) << 4);
+            cpu_set_reg8(reg, reg_val);
+            cpu_set_flags(ctx, reg_val == 0, false, false, false);
+        } return;
+
+        case 7: {
+            //SRL
+            u8 u = reg_val >> 1;
+            cpu_set_reg8(reg, u);
+            cpu_set_flags(ctx, !u, 0, 0, reg_val & 1);
+        } return;
+    }
+
+    fprintf(stderr, "ERROR: INVALID CB: %02X", op);
+    NO_IMPL
+}
+
+static void proc_rlca(cpu_context *ctx) {
+    u8 u = ctx->regs.a;
+    bool c = (u >> 7) & 1;
+    u = (u << 1) | c;
+    ctx->regs.a = u;
+
+    cpu_set_flags(ctx, 0, 0, 0, c);
+}
+
+static void proc_rrca(cpu_context *ctx) {
+    u8 b = ctx->regs.a & 1;
+    ctx->regs.a >>= 1;
+    ctx->regs.a |= (b << 7);
+
+    cpu_set_flags(ctx, 0, 0, 0, b);
+}
+
+
+static void proc_rla(cpu_context *ctx) {
+    u8 u = ctx->regs.a;
+    u8 cf = CPU_FLAG_C;
+    u8 c = (u >> 7) & 1;
+
+    ctx->regs.a = (u << 1) | cf;
+    cpu_set_flags(ctx, 0, 0, 0, c);
+}
+
+static void proc_stop(cpu_context *ctx) {
+    fprintf(stderr, "STOPPING!\n");
+}
+
+static void proc_daa(cpu_context *ctx) {
+    u8 u = 0;
+    int fc = 0;
+
+    if (CPU_FLAG_H || (!CPU_FLAG_N && (ctx->regs.a & 0xF) > 9)) {
+        u = 6;
+    }
+
+    if (CPU_FLAG_C || (!CPU_FLAG_N && ctx->regs.a > 0x99)) {
+        u |= 0x60;
+        fc = 1;
+    }
+
+    ctx->regs.a += CPU_FLAG_N ? -u : u;
+
+    cpu_set_flags(ctx, ctx->regs.a == 0, -1, 0, fc);
+}
+
+static void proc_cpl(cpu_context *ctx) {
+    ctx->regs.a = ~ctx->regs.a;
+    cpu_set_flags(ctx, -1, 1, 1, -1);
+}
+
+static void proc_scf(cpu_context *ctx) {
+    cpu_set_flags(ctx, -1, 0, 0, 1);
+}
+
+static void proc_ccf(cpu_context *ctx) {
+    cpu_set_flags(ctx, -1, 0, 0, CPU_FLAG_C ^ 1);
+}
+
+static void proc_halt(cpu_context *ctx) {
+    ctx->halted = true;
+}
+
+static void proc_rra(cpu_context *ctx) {
+    u8 carry = CPU_FLAG_C;
+    u8 new_c = ctx->regs.a & 1;
+
+    ctx->regs.a >>= 1;
+    ctx->regs.a |= (carry << 7);
+
+    cpu_set_flags(ctx, 0, 0, 0, new_c);
+}
+
+static void proc_and(cpu_context *ctx) {
+    ctx->regs.a &= ctx->fetched_data;
+    cpu_set_flags(ctx, ctx->regs.a == 0, 0, 1, 0);
+}
+
+static void proc_xor(cpu_context *ctx) {
+    ctx->regs.a ^= ctx->fetched_data & 0xFF;
+    cpu_set_flags(ctx, ctx->regs.a == 0, 0, 0, 0);
+}
+
+static void proc_or(cpu_context *ctx) {
+    ctx->regs.a |= ctx->fetched_data & 0xFF;
+    cpu_set_flags(ctx, ctx->regs.a == 0, 0, 0, 0);
+}
+
+static void proc_cp(cpu_context *ctx) {
+    int n = (int)ctx->regs.a - (int)ctx->fetched_data;
+
+    cpu_set_flags(ctx, n == 0, 1, 
+        ((int)ctx->regs.a & 0x0F) - ((int)ctx->fetched_data & 0x0F) < 0, n < 0);
+}
+
+static void proc_di(cpu_context *ctx) {
+    ctx->int_master_enabled = false;
+}
+
+static void proc_ei(cpu_context *ctx) {
+    ctx->enabling_ime = true;
+}
+
+static bool is_16_bit(reg_type rt) {
+    return rt >= RT_AF;
+}
+
+static void proc_ld(cpu_context *ctx) {
+    if (ctx->dest_is_mem) {
+        //LD (BC), A for instance...
+
+        if (is_16_bit(ctx->cur_inst->reg_2)) {
+            //if 16 bit register...
+            emu_cycles(1);
+            bus_write16(ctx->mem_dest, ctx->fetched_data);
+        } else {
+            bus_write(ctx->mem_dest, ctx->fetched_data);
+        }
+
+        emu_cycles(1);
+
+        return;
+    }
+
+    if (ctx->cur_inst->mode == AM_HL_SPR) {
+        u8 hflag = (cpu_read_reg(ctx->cur_inst->reg_2) & 0xF) + 
+            (ctx->fetched_data & 0xF) >= 0x10;
+
+        u8 cflag = (cpu_read_reg(ctx->cur_inst->reg_2) & 0xFF) + 
+            (ctx->fetched_data & 0xFF) >= 0x100;
+
+        cpu_set_flags(ctx, 0, 0, hflag, cflag);
+        cpu_set_reg(ctx->cur_inst->reg_1, 
+            cpu_read_reg(ctx->cur_inst->reg_2) + (int8_t)ctx->fetched_data);
+
+        return;
+    }
+
+    cpu_set_reg(ctx->cur_inst->reg_1, ctx->fetched_data);
+}
+
+static void proc_ldh(cpu_context *ctx) {
+    if (ctx->cur_inst->reg_1 == RT_A) {
+        cpu_set_reg(ctx->cur_inst->reg_1, bus_read(0xFF00 | ctx->fetched_data));
+    } else {
+        bus_write(ctx->mem_dest, ctx->regs.a);
+    }
+
+    emu_cycles(1);
+}
+
+
+static bool check_cond(cpu_context *ctx) {
+    bool z = CPU_FLAG_Z;
+    bool c = CPU_FLAG_C;
+
+    switch(ctx->cur_inst->cond) {
+        case CT_NONE: return true;
+        case CT_C: return c;
+        case CT_NC: return !c;
+        case CT_Z: return z;
+        case CT_NZ: return !z;
+    }
+
+    return false;
+}
+
+static void goto_addr(cpu_context *ctx, u16 addr, bool pushpc) {
+    if (check_cond(ctx)) {
+        if (pushpc) {
+            emu_cycles(2);
+            stack_push16(ctx->regs.pc);
+        }
+
+        ctx->regs.pc = addr;
+        emu_cycles(1);
+    }
+}
+
+static void proc_jp(cpu_context *ctx) {
+    goto_addr(ctx, ctx->fetched_data, false);
+}
+
+static void proc_jr(cpu_context *ctx) {
+    int8_t rel = (int8_t)(ctx->fetched_data & 0xFF);
+    u16 addr = ctx->regs.pc + rel;
+    goto_addr(ctx, addr, false);
+}
+
+static void proc_call(cpu_context *ctx) {
+    goto_addr(ctx, ctx->fetched_data, true);
+}
+
+static void proc_rst(cpu_context *ctx) {
+    goto_addr(ctx, ctx->cur_inst->param, true);
+}
+
+static void proc_ret(cpu_context *ctx) {
+    if (ctx->cur_inst->cond != CT_NONE) {
+        emu_cycles(1);
+    }
+
+    if (check_cond(ctx)) {
+        u16 lo = stack_pop();
+        emu_cycles(1);
+        u16 hi = stack_pop();
+        emu_cycles(1);
+
+        u16 n = (hi << 8) | lo;
+        ctx->regs.pc = n;
+
+        emu_cycles(1);
+    }
+}
+
+static void proc_reti(cpu_context *ctx) {
+    ctx->int_master_enabled = true;
+    proc_ret(ctx);
+}
+
+static void proc_pop(cpu_context *ctx) {
+    u16 lo = stack_pop();
+    emu_cycles(1);
+    u16 hi = stack_pop();
+    emu_cycles(1);
+
+    u16 n = (hi << 8) | lo;
+
+    cpu_set_reg(ctx->cur_inst->reg_1, n);
+
+    if (ctx->cur_inst->reg_1 == RT_AF) {
+        cpu_set_reg(ctx->cur_inst->reg_1, n & 0xFFF0);
+    }
+}
+
+static void proc_push(cpu_context *ctx) {
+    u16 hi = (cpu_read_reg(ctx->cur_inst->reg_1) >> 8) & 0xFF;
+    emu_cycles(1);
+    stack_push(hi);
+
+    u16 lo = cpu_read_reg(ctx->cur_inst->reg_1) & 0xFF;
+    emu_cycles(1);
+    stack_push(lo);
+    
+    emu_cycles(1);
+}
+
+static void proc_inc(cpu_context *ctx) {
+    u16 val = cpu_read_reg(ctx->cur_inst->reg_1) + 1;
+
+    if (is_16_bit(ctx->cur_inst->reg_1)) {
+        emu_cycles(1);
+    }
+
+    if (ctx->cur_inst->reg_1 == RT_HL && ctx->cur_inst->mode == AM_MR) {
+        val = bus_read(cpu_read_reg(RT_HL)) + 1;
+        val &= 0xFF;
+        bus_write(cpu_read_reg(RT_HL), val);
+    } else {
+        cpu_set_reg(ctx->cur_inst->reg_1, val);
+        val = cpu_read_reg(ctx->cur_inst->reg_1);
+    }
+
+    if ((ctx->cur_opcode & 0x03) == 0x03) {
+        return;
+    }
+
+    cpu_set_flags(ctx, val == 0, 0, (val & 0x0F) == 0, -1);
+}
+
+static void proc_dec(cpu_context *ctx) {
+    u16 val = cpu_read_reg(ctx->cur_inst->reg_1) - 1;
+
+    if (is_16_bit(ctx->cur_inst->reg_1)) {
+        emu_cycles(1);
+    }
+
+    if (ctx->cur_inst->reg_1 == RT_HL && ctx->cur_inst->mode == AM_MR) {
+        val = bus_read(cpu_read_reg(RT_HL)) - 1;
+        bus_write(cpu_read_reg(RT_HL), val);
+    } else {
+        cpu_set_reg(ctx->cur_inst->reg_1, val);
+        val = cpu_read_reg(ctx->cur_inst->reg_1);
+    }
+
+    if ((ctx->cur_opcode & 0x0B) == 0x0B) {
+        return;
+    }
+
+    cpu_set_flags(ctx, val == 0, 1, (val & 0x0F) == 0x0F, -1);
+}
+
+static void proc_sub(cpu_context *ctx) {
+    u16 val = cpu_read_reg(ctx->cur_inst->reg_1) - ctx->fetched_data;
+
+    int z = val == 0;
+    int h = ((int)cpu_read_reg(ctx->cur_inst->reg_1) & 0xF) - ((int)ctx->fetched_data & 0xF) < 0;
+    int c = ((int)cpu_read_reg(ctx->cur_inst->reg_1)) - ((int)ctx->fetched_data) < 0;
+
+    cpu_set_reg(ctx->cur_inst->reg_1, val);
+    cpu_set_flags(ctx, z, 1, h, c);
+}
+
+static void proc_sbc(cpu_context *ctx) {
+    u8 val = ctx->fetched_data + CPU_FLAG_C;
+
+    int z = cpu_read_reg(ctx->cur_inst->reg_1) - val == 0;
+
+    int h = ((int)cpu_read_reg(ctx->cur_inst->reg_1) & 0xF) 
+        - ((int)ctx->fetched_data & 0xF) - ((int)CPU_FLAG_C) < 0;
+    int c = ((int)cpu_read_reg(ctx->cur_inst->reg_1)) 
+        - ((int)ctx->fetched_data) - ((int)CPU_FLAG_C) < 0;
+
+    cpu_set_reg(ctx->cur_inst->reg_1, cpu_read_reg(ctx->cur_inst->reg_1) - val);
+    cpu_set_flags(ctx, z, 1, h, c);
+}
+
+static void proc_adc(cpu_context *ctx) {
+    u16 u = ctx->fetched_data;
+    u16 a = ctx->regs.a;
+    u16 c = CPU_FLAG_C;
+
+    ctx->regs.a = (a + u + c) & 0xFF;
+
+    cpu_set_flags(ctx, ctx->regs.a == 0, 0, 
+        (a & 0xF) + (u & 0xF) + c > 0xF,
+        a + u + c > 0xFF);
+}
+
+static void proc_add(cpu_context *ctx) {
+    u32 val = cpu_read_reg(ctx->cur_inst->reg_1) + ctx->fetched_data;
+
+    bool is_16bit = is_16_bit(ctx->cur_inst->reg_1);
+
+    if (is_16bit) {
+        emu_cycles(1);
+    }
+
+    if (ctx->cur_inst->reg_1 == RT_SP) {
+        val = cpu_read_reg(ctx->cur_inst->reg_1) + (int8_t)ctx->fetched_data;
+    }
+
+    int z = (val & 0xFF) == 0;
+    int h = (cpu_read_reg(ctx->cur_inst->reg_1) & 0xF) + (ctx->fetched_data & 0xF) >= 0x10;
+    int c = (int)(cpu_read_reg(ctx->cur_inst->reg_1) & 0xFF) + (int)(ctx->fetched_data & 0xFF) >= 0x100;
+
+    if (is_16bit) {
+        z = -1;
+        h = (cpu_read_reg(ctx->cur_inst->reg_1) & 0xFFF) + (ctx->fetched_data & 0xFFF) >= 0x1000;
+        u32 n = ((u32)cpu_read_reg(ctx->cur_inst->reg_1)) + ((u32)ctx->fetched_data);
+        c = n >= 0x10000;
+    }
+
+    if (ctx->cur_inst->reg_1 == RT_SP) {
+        z = 0;
+        h = (cpu_read_reg(ctx->cur_inst->reg_1) & 0xF) + (ctx->fetched_data & 0xF) >= 0x10;
+        c = (int)(cpu_read_reg(ctx->cur_inst->reg_1) & 0xFF) + (int)(ctx->fetched_data & 0xFF) >= 0x100;
+    }
+
+    cpu_set_reg(ctx->cur_inst->reg_1, val & 0xFFFF);
+    cpu_set_flags(ctx, z, 0, h, c);
+}
+
+static IN_PROC processors[] = {
+    [IN_NONE] = proc_none,
+    [IN_NOP] = proc_nop,
+    [IN_LD] = proc_ld,
+    [IN_LDH] = proc_ldh,
+    [IN_JP] = proc_jp,
+    [IN_DI] = proc_di,
+    [IN_POP] = proc_pop,
+    [IN_PUSH] = proc_push,
+    [IN_JR] = proc_jr,
+    [IN_CALL] = proc_call,
+    [IN_RET] = proc_ret,
+    [IN_RST] = proc_rst,
+    [IN_DEC] = proc_dec,
+    [IN_INC] = proc_inc,
+    [IN_ADD] = proc_add,
+    [IN_ADC] = proc_adc,
+    [IN_SUB] = proc_sub,
+    [IN_SBC] = proc_sbc,
+    [IN_AND] = proc_and,
+    [IN_XOR] = proc_xor,
+    [IN_OR] = proc_or,
+    [IN_CP] = proc_cp,
+    [IN_CB] = proc_cb,
+    [IN_RRCA] = proc_rrca,
+    [IN_RLCA] = proc_rlca,
+    [IN_RRA] = proc_rra,
+    [IN_RLA] = proc_rla,
+    [IN_STOP] = proc_stop,
+    [IN_HALT] = proc_halt,
+    [IN_DAA] = proc_daa,
+    [IN_CPL] = proc_cpl,
+    [IN_SCF] = proc_scf,
+    [IN_CCF] = proc_ccf,
+    [IN_EI] = proc_ei,
+    [IN_RETI] = proc_reti
+};
+
+IN_PROC inst_get_processor(in_type type) {
+    return processors[type];
+}===== cpu_util.c =====  
+#include <cpu.h>
+#include <bus.h>
+
+extern cpu_context ctx;
+
+u16 reverse(u16 n) {
+    return ((n & 0xFF00) >> 8) | ((n & 0x00FF) << 8);
+}
+
+u16 cpu_read_reg(reg_type rt) {
+    switch(rt) {
+        case RT_A: return ctx.regs.a;
+        case RT_F: return ctx.regs.f;
+        case RT_B: return ctx.regs.b;
+        case RT_C: return ctx.regs.c;
+        case RT_D: return ctx.regs.d;
+        case RT_E: return ctx.regs.e;
+        case RT_H: return ctx.regs.h;
+        case RT_L: return ctx.regs.l;
+
+        case RT_AF: return reverse(*((u16 *)&ctx.regs.a));
+        case RT_BC: return reverse(*((u16 *)&ctx.regs.b));
+        case RT_DE: return reverse(*((u16 *)&ctx.regs.d));
+        case RT_HL: return reverse(*((u16 *)&ctx.regs.h));
+
+        case RT_PC: return ctx.regs.pc;
+        case RT_SP: return ctx.regs.sp;
+        default: return 0;
+    }
+}
+
+void cpu_set_reg(reg_type rt, u16 val) {
+    switch(rt) {
+        case RT_A: ctx.regs.a = val & 0xFF; break;
+        case RT_F: ctx.regs.f = val & 0xFF; break;
+        case RT_B: ctx.regs.b = val & 0xFF; break;
+        case RT_C: {
+             ctx.regs.c = val & 0xFF;
+        } break;
+        case RT_D: ctx.regs.d = val & 0xFF; break;
+        case RT_E: ctx.regs.e = val & 0xFF; break;
+        case RT_H: ctx.regs.h = val & 0xFF; break;
+        case RT_L: ctx.regs.l = val & 0xFF; break;
+
+        case RT_AF: *((u16 *)&ctx.regs.a) = reverse(val); break;
+        case RT_BC: *((u16 *)&ctx.regs.b) = reverse(val); break;
+        case RT_DE: *((u16 *)&ctx.regs.d) = reverse(val); break;
+        case RT_HL: {
+         *((u16 *)&ctx.regs.h) = reverse(val); 
+         break;
+        }
+
+        case RT_PC: ctx.regs.pc = val; break;
+        case RT_SP: ctx.regs.sp = val; break;
+        case RT_NONE: break;
+    }
+}
+
+
+u8 cpu_read_reg8(reg_type rt) {
+    switch(rt) {
+        case RT_A: return ctx.regs.a;
+        case RT_F: return ctx.regs.f;
+        case RT_B: return ctx.regs.b;
+        case RT_C: return ctx.regs.c;
+        case RT_D: return ctx.regs.d;
+        case RT_E: return ctx.regs.e;
+        case RT_H: return ctx.regs.h;
+        case RT_L: return ctx.regs.l;
+        case RT_HL: {
+            return bus_read(cpu_read_reg(RT_HL));
+        }
+        default:
+            printf("**ERR INVALID REG8: %d\n", rt);
+            NO_IMPL
+    }
+}
+
+void cpu_set_reg8(reg_type rt, u8 val) {
+    switch(rt) {
+        case RT_A: ctx.regs.a = val & 0xFF; break;
+        case RT_F: ctx.regs.f = val & 0xFF; break;
+        case RT_B: ctx.regs.b = val & 0xFF; break;
+        case RT_C: ctx.regs.c = val & 0xFF; break;
+        case RT_D: ctx.regs.d = val & 0xFF; break;
+        case RT_E: ctx.regs.e = val & 0xFF; break;
+        case RT_H: ctx.regs.h = val & 0xFF; break;
+        case RT_L: ctx.regs.l = val & 0xFF; break;
+        case RT_HL: bus_write(cpu_read_reg(RT_HL), val); break;
+        default:
+            printf("**ERR INVALID REG8: %d\n", rt);
+            NO_IMPL
+    }
+}
+
+cpu_registers *cpu_get_regs() {
+    return &ctx.regs;
+}
+
+u8 cpu_get_int_flags() {
+    return ctx.int_flags;
+}
+
+void cpu_set_int_flags(u8 value) {
+    ctx.int_flags = value;
+}
+===== dbg.c =====  
+#include <dbg.h>
+#include <bus.h>
+
+static char dbg_msg[1024] = {0};
+static int msg_size = 0;
+
+void dbg_update() {
+    if (bus_read(0xFF02) == 0x81) {
+        char c = bus_read(0xFF01);
+
+        dbg_msg[msg_size++] = c;
+
+        bus_write(0xFF02, 0);
+    }
+}
+
+void dbg_print() {
+    if (dbg_msg[0]) {
+        //printf("DBG: %s\n", dbg_msg);
+    }
+}
+===== dma.c =====  
+#include <dma.h>
+#include <ppu.h>
+#include <bus.h>
+
+typedef struct {
+    bool active;
+    u8 byte;
+    u8 value;
+    u8 start_delay;
+} dma_context;
+
+static dma_context ctx;
+
+void dma_start(u8 start) {
+    ctx.active = true;
+    ctx.byte = 0;
+    ctx.start_delay = 2;
+    ctx.value = start;
+}
+
+void dma_tick() {
+    if (!ctx.active) {
+        return;
+    }
+
+    if (ctx.start_delay) {
+        ctx.start_delay--;
+        return;
+    }
+
+    ppu_oam_write(ctx.byte, bus_read((ctx.value * 0x100) + ctx.byte));
+
+    ctx.byte++;
+
+    ctx.active = ctx.byte < 0xA0;
+}
+
+bool dma_transferring() {
+    return ctx.active;
+}
+
+===== emu.c =====  
+#include <stdio.h>
+#include <emu.h>
+#include <cart.h>
+#include <cpu.h>
+#include <ui.h>
+#include <timer.h>
+#include <dma.h>
+#include <ppu.h>
+
+//TODO Add Windows Alternative...
+#include <pthread.h>
+#include <unistd.h>
+
+/* 
+  Emu components:
+
+  |Cart|
+  |CPU|
+  |Address Bus|
+  |PPU|
+  |Timer|
+
+*/
+
+static emu_context ctx;
+
+emu_context *emu_get_context() {
+    return &ctx;
+}
+
+void *cpu_run(void *p) {
+    timer_init();
+    cpu_init();
+    ppu_init();
+
+    ctx.running = true;
+    ctx.paused = false;
+    ctx.ticks = 0;
+
+    while(ctx.running) {
+        if (ctx.paused) {
+            delay(10);
+            continue;
+        }
+
+        if (!cpu_step()) {
+            printf("CPU Stopped\n");
+            return 0;
+        }
+    }
+
+    return 0;
+}
+
+int emu_run(int argc, char **argv) {
+    if (argc < 2) {
+        printf("Usage: emu <rom_file>\n");
+        return -1;
+    }
+
+    if (!cart_load(argv[1])) {
+        printf("Failed to load ROM file: %s\n", argv[1]);
+        return -2;
+    }
+
+    printf("Cart loaded..\n");
+
+    ui_init();
+    
+    pthread_t t1;
+
+    if (pthread_create(&t1, NULL, cpu_run, NULL)) {
+        fprintf(stderr, "FAILED TO START MAIN CPU THREAD!\n");
+        return -1;
+    }
+
+    u32 prev_frame = 0;
+
+    while(!ctx.die) {
+        usleep(1000);
+        ui_handle_events();
+
+        if (prev_frame != ppu_get_context()->current_frame) {
+            ui_update();
+        }
+
+        prev_frame = ppu_get_context()->current_frame;
+    }
+
+    return 0;
+}
+
+void emu_cycles(int cpu_cycles) {
+    
+    for (int i=0; i<cpu_cycles; i++) {
+        for (int n=0; n<4; n++) {
+            ctx.ticks++;
+            timer_tick();
+            ppu_tick();
+        }
+
+        dma_tick();
+    }
+}
+===== gamepad.c =====  
+#include <gamepad.h>
+#include <string.h>
+
+typedef struct {
+    bool button_sel;
+    bool dir_sel;
+    gamepad_state controller;
+} gamepad_context;
+
+static gamepad_context ctx = {0};
+
+bool gamepad_button_sel() {
+    return ctx.button_sel;
+}
+
+bool gamepad_dir_sel() {
+    return ctx.dir_sel;
+}
+
+void gamepad_set_sel(u8 value) {
+    ctx.button_sel = value & 0x20;
+    ctx.dir_sel = value & 0x10;
+}
+
+gamepad_state *gamepad_get_state() {
+    return &ctx.controller;
+}
+
+u8 gamepad_get_output() {
+    u8 output = 0xCF;
+
+    if (!gamepad_button_sel()) {
+        if (gamepad_get_state()->start) {
+            output &= ~(1 << 3);
+        } 
+        if (gamepad_get_state()->select) {
+            output &= ~(1 << 2);
+        } 
+        if (gamepad_get_state()->a) {
+            output &= ~(1 << 0);
+        } 
+        if (gamepad_get_state()->b) {
+            output &= ~(1 << 1);
+        }
+    }
+
+    if (!gamepad_dir_sel()) {
+        if (gamepad_get_state()->left) {
+            output &= ~(1 << 1);
+        } 
+        if (gamepad_get_state()->right) {
+            output &= ~(1 << 0);
+        } 
+        if (gamepad_get_state()->up) {
+            output &= ~(1 << 2);
+        } 
+        if (gamepad_get_state()->down) {
+            output &= ~(1 << 3);
+        }
+    }
+
+    return output;
+}===== instructions.c =====  
+#include <instructions.h>
+#include <cpu.h>
+#include <bus.h>
+
+instruction instructions[0x100] = {
+    [0x00] = {IN_NOP, AM_IMP},
+    [0x01] = {IN_LD, AM_R_D16, RT_BC},
+    [0x02] = {IN_LD, AM_MR_R, RT_BC, RT_A},
+    [0x03] = {IN_INC, AM_R, RT_BC},
+    [0x04] = {IN_INC, AM_R, RT_B},
+    [0x05] = {IN_DEC, AM_R, RT_B},
+    [0x06] = {IN_LD, AM_R_D8, RT_B},
+    [0x07] = {IN_RLCA},
+    [0x08] = {IN_LD, AM_A16_R, RT_NONE, RT_SP},
+    [0x09] = {IN_ADD, AM_R_R, RT_HL, RT_BC},
+    [0x0A] = {IN_LD, AM_R_MR, RT_A, RT_BC},
+    [0x0B] = {IN_DEC, AM_R, RT_BC},
+    [0x0C] = {IN_INC, AM_R, RT_C},
+    [0x0D] = {IN_DEC, AM_R, RT_C},
+    [0x0E] = {IN_LD, AM_R_D8, RT_C},
+    [0x0F] = {IN_RRCA},
+
+    //0x1X
+    [0x10] = {IN_STOP},
+    [0x11] = {IN_LD, AM_R_D16, RT_DE},
+    [0x12] = {IN_LD, AM_MR_R, RT_DE, RT_A},
+    [0x13] = {IN_INC, AM_R, RT_DE},
+    [0x14] = {IN_INC, AM_R, RT_D},
+    [0x15] = {IN_DEC, AM_R, RT_D},
+    [0x16] = {IN_LD, AM_R_D8, RT_D},
+    [0x17] = {IN_RLA},
+    [0x18] = {IN_JR, AM_D8},
+    [0x19] = {IN_ADD, AM_R_R, RT_HL, RT_DE},
+    [0x1A] = {IN_LD, AM_R_MR, RT_A, RT_DE},
+    [0x1B] = {IN_DEC, AM_R, RT_DE},
+    [0x1C] = {IN_INC, AM_R, RT_E},
+    [0x1D] = {IN_DEC, AM_R, RT_E},
+    [0x1E] = {IN_LD, AM_R_D8, RT_E},
+    [0x1F] = {IN_RRA},
+
+    //0x2X
+    [0x20] = {IN_JR, AM_D8, RT_NONE, RT_NONE, CT_NZ},
+    [0x21] = {IN_LD, AM_R_D16, RT_HL},
+    [0x22] = {IN_LD, AM_HLI_R, RT_HL, RT_A},
+    [0x23] = {IN_INC, AM_R, RT_HL},
+    [0x24] = {IN_INC, AM_R, RT_H},
+    [0x25] = {IN_DEC, AM_R, RT_H},
+    [0x26] = {IN_LD, AM_R_D8, RT_H},
+    [0x27] = {IN_DAA},
+    [0x28] = {IN_JR, AM_D8, RT_NONE, RT_NONE, CT_Z},
+    [0x29] = {IN_ADD, AM_R_R, RT_HL, RT_HL},
+    [0x2A] = {IN_LD, AM_R_HLI, RT_A, RT_HL},
+    [0x2B] = {IN_DEC, AM_R, RT_HL},
+    [0x2C] = {IN_INC, AM_R, RT_L},
+    [0x2D] = {IN_DEC, AM_R, RT_L},
+    [0x2E] = {IN_LD, AM_R_D8, RT_L},
+    [0x2F] = {IN_CPL},
+
+    //0x3X
+    [0x30] = {IN_JR, AM_D8, RT_NONE, RT_NONE, CT_NC},
+    [0x31] = {IN_LD, AM_R_D16, RT_SP},
+    [0x32] = {IN_LD, AM_HLD_R, RT_HL, RT_A},
+    [0x33] = {IN_INC, AM_R, RT_SP},
+    [0x34] = {IN_INC, AM_MR, RT_HL},
+    [0x35] = {IN_DEC, AM_MR, RT_HL},
+    [0x36] = {IN_LD, AM_MR_D8, RT_HL},
+    [0x37] = {IN_SCF},
+    [0x38] = {IN_JR, AM_D8, RT_NONE, RT_NONE, CT_C},
+    [0x39] = {IN_ADD, AM_R_R, RT_HL, RT_SP},
+    [0x3A] = {IN_LD, AM_R_HLD, RT_A, RT_HL},
+    [0x3B] = {IN_DEC, AM_R, RT_SP},
+    [0x3C] = {IN_INC, AM_R, RT_A},
+    [0x3D] = {IN_DEC, AM_R, RT_A},
+    [0x3E] = {IN_LD, AM_R_D8, RT_A},
+    [0x3F] = {IN_CCF},
+
+    //0x4X
+    [0x40] = {IN_LD, AM_R_R, RT_B, RT_B},
+    [0x41] = {IN_LD, AM_R_R, RT_B, RT_C},
+    [0x42] = {IN_LD, AM_R_R, RT_B, RT_D},
+    [0x43] = {IN_LD, AM_R_R, RT_B, RT_E},
+    [0x44] = {IN_LD, AM_R_R, RT_B, RT_H},
+    [0x45] = {IN_LD, AM_R_R, RT_B, RT_L},
+    [0x46] = {IN_LD, AM_R_MR, RT_B, RT_HL},
+    [0x47] = {IN_LD, AM_R_R, RT_B, RT_A},
+    [0x48] = {IN_LD, AM_R_R, RT_C, RT_B},
+    [0x49] = {IN_LD, AM_R_R, RT_C, RT_C},
+    [0x4A] = {IN_LD, AM_R_R, RT_C, RT_D},
+    [0x4B] = {IN_LD, AM_R_R, RT_C, RT_E},
+    [0x4C] = {IN_LD, AM_R_R, RT_C, RT_H},
+    [0x4D] = {IN_LD, AM_R_R, RT_C, RT_L},
+    [0x4E] = {IN_LD, AM_R_MR, RT_C, RT_HL},
+    [0x4F] = {IN_LD, AM_R_R, RT_C, RT_A},
+
+    //0x5X
+    [0x50] = {IN_LD, AM_R_R,  RT_D, RT_B},
+    [0x51] = {IN_LD, AM_R_R,  RT_D, RT_C},
+    [0x52] = {IN_LD, AM_R_R,  RT_D, RT_D},
+    [0x53] = {IN_LD, AM_R_R,  RT_D, RT_E},
+    [0x54] = {IN_LD, AM_R_R,  RT_D, RT_H},
+    [0x55] = {IN_LD, AM_R_R,  RT_D, RT_L},
+    [0x56] = {IN_LD, AM_R_MR, RT_D, RT_HL},
+    [0x57] = {IN_LD, AM_R_R,  RT_D, RT_A},
+    [0x58] = {IN_LD, AM_R_R,  RT_E, RT_B},
+    [0x59] = {IN_LD, AM_R_R,  RT_E, RT_C},
+    [0x5A] = {IN_LD, AM_R_R,  RT_E, RT_D},
+    [0x5B] = {IN_LD, AM_R_R,  RT_E, RT_E},
+    [0x5C] = {IN_LD, AM_R_R,  RT_E, RT_H},
+    [0x5D] = {IN_LD, AM_R_R,  RT_E, RT_L},
+    [0x5E] = {IN_LD, AM_R_MR, RT_E, RT_HL},
+    [0x5F] = {IN_LD, AM_R_R,  RT_E, RT_A},
+
+    //0x6X
+    [0x60] = {IN_LD, AM_R_R,  RT_H, RT_B},
+    [0x61] = {IN_LD, AM_R_R,  RT_H, RT_C},
+    [0x62] = {IN_LD, AM_R_R,  RT_H, RT_D},
+    [0x63] = {IN_LD, AM_R_R,  RT_H, RT_E},
+    [0x64] = {IN_LD, AM_R_R,  RT_H, RT_H},
+    [0x65] = {IN_LD, AM_R_R,  RT_H, RT_L},
+    [0x66] = {IN_LD, AM_R_MR, RT_H, RT_HL},
+    [0x67] = {IN_LD, AM_R_R,  RT_H, RT_A},
+    [0x68] = {IN_LD, AM_R_R,  RT_L, RT_B},
+    [0x69] = {IN_LD, AM_R_R,  RT_L, RT_C},
+    [0x6A] = {IN_LD, AM_R_R,  RT_L, RT_D},
+    [0x6B] = {IN_LD, AM_R_R,  RT_L, RT_E},
+    [0x6C] = {IN_LD, AM_R_R,  RT_L, RT_H},
+    [0x6D] = {IN_LD, AM_R_R,  RT_L, RT_L},
+    [0x6E] = {IN_LD, AM_R_MR, RT_L, RT_HL},
+    [0x6F] = {IN_LD, AM_R_R,  RT_L, RT_A},
+
+    //0x7X
+    [0x70] = {IN_LD, AM_MR_R,  RT_HL, RT_B},
+    [0x71] = {IN_LD, AM_MR_R,  RT_HL, RT_C},
+    [0x72] = {IN_LD, AM_MR_R,  RT_HL, RT_D},
+    [0x73] = {IN_LD, AM_MR_R,  RT_HL, RT_E},
+    [0x74] = {IN_LD, AM_MR_R,  RT_HL, RT_H},
+    [0x75] = {IN_LD, AM_MR_R,  RT_HL, RT_L},
+    [0x76] = {IN_HALT},
+    [0x77] = {IN_LD, AM_MR_R,  RT_HL, RT_A},
+    [0x78] = {IN_LD, AM_R_R,  RT_A, RT_B},
+    [0x79] = {IN_LD, AM_R_R,  RT_A, RT_C},
+    [0x7A] = {IN_LD, AM_R_R,  RT_A, RT_D},
+    [0x7B] = {IN_LD, AM_R_R,  RT_A, RT_E},
+    [0x7C] = {IN_LD, AM_R_R,  RT_A, RT_H},
+    [0x7D] = {IN_LD, AM_R_R,  RT_A, RT_L},
+    [0x7E] = {IN_LD, AM_R_MR, RT_A, RT_HL},
+    [0x7F] = {IN_LD, AM_R_R,  RT_A, RT_A},
+
+    //0x8X
+    [0x80] = {IN_ADD, AM_R_R, RT_A, RT_B},
+    [0x81] = {IN_ADD, AM_R_R, RT_A, RT_C},
+    [0x82] = {IN_ADD, AM_R_R, RT_A, RT_D},
+    [0x83] = {IN_ADD, AM_R_R, RT_A, RT_E},
+    [0x84] = {IN_ADD, AM_R_R, RT_A, RT_H},
+    [0x85] = {IN_ADD, AM_R_R, RT_A, RT_L},
+    [0x86] = {IN_ADD, AM_R_MR, RT_A, RT_HL},
+    [0x87] = {IN_ADD, AM_R_R, RT_A, RT_A},
+    [0x88] = {IN_ADC, AM_R_R, RT_A, RT_B},
+    [0x89] = {IN_ADC, AM_R_R, RT_A, RT_C},
+    [0x8A] = {IN_ADC, AM_R_R, RT_A, RT_D},
+    [0x8B] = {IN_ADC, AM_R_R, RT_A, RT_E},
+    [0x8C] = {IN_ADC, AM_R_R, RT_A, RT_H},
+    [0x8D] = {IN_ADC, AM_R_R, RT_A, RT_L},
+    [0x8E] = {IN_ADC, AM_R_MR, RT_A, RT_HL},
+    [0x8F] = {IN_ADC, AM_R_R, RT_A, RT_A},
+
+    //0x9X
+    [0x90] = {IN_SUB, AM_R_R, RT_A, RT_B},
+    [0x91] = {IN_SUB, AM_R_R, RT_A, RT_C},
+    [0x92] = {IN_SUB, AM_R_R, RT_A, RT_D},
+    [0x93] = {IN_SUB, AM_R_R, RT_A, RT_E},
+    [0x94] = {IN_SUB, AM_R_R, RT_A, RT_H},
+    [0x95] = {IN_SUB, AM_R_R, RT_A, RT_L},
+    [0x96] = {IN_SUB, AM_R_MR, RT_A, RT_HL},
+    [0x97] = {IN_SUB, AM_R_R, RT_A, RT_A},
+    [0x98] = {IN_SBC, AM_R_R, RT_A, RT_B},
+    [0x99] = {IN_SBC, AM_R_R, RT_A, RT_C},
+    [0x9A] = {IN_SBC, AM_R_R, RT_A, RT_D},
+    [0x9B] = {IN_SBC, AM_R_R, RT_A, RT_E},
+    [0x9C] = {IN_SBC, AM_R_R, RT_A, RT_H},
+    [0x9D] = {IN_SBC, AM_R_R, RT_A, RT_L},
+    [0x9E] = {IN_SBC, AM_R_MR, RT_A, RT_HL},
+    [0x9F] = {IN_SBC, AM_R_R, RT_A, RT_A},
+
+
+    //0xAX
+    [0xA0] = {IN_AND, AM_R_R, RT_A, RT_B},
+    [0xA1] = {IN_AND, AM_R_R, RT_A, RT_C},
+    [0xA2] = {IN_AND, AM_R_R, RT_A, RT_D},
+    [0xA3] = {IN_AND, AM_R_R, RT_A, RT_E},
+    [0xA4] = {IN_AND, AM_R_R, RT_A, RT_H},
+    [0xA5] = {IN_AND, AM_R_R, RT_A, RT_L},
+    [0xA6] = {IN_AND, AM_R_MR, RT_A, RT_HL},
+    [0xA7] = {IN_AND, AM_R_R, RT_A, RT_A},
+    [0xA8] = {IN_XOR, AM_R_R, RT_A, RT_B},
+    [0xA9] = {IN_XOR, AM_R_R, RT_A, RT_C},
+    [0xAA] = {IN_XOR, AM_R_R, RT_A, RT_D},
+    [0xAB] = {IN_XOR, AM_R_R, RT_A, RT_E},
+    [0xAC] = {IN_XOR, AM_R_R, RT_A, RT_H},
+    [0xAD] = {IN_XOR, AM_R_R, RT_A, RT_L},
+    [0xAE] = {IN_XOR, AM_R_MR, RT_A, RT_HL},
+    [0xAF] = {IN_XOR, AM_R_R, RT_A, RT_A},
+
+    //0xBX
+    [0xB0] = {IN_OR, AM_R_R, RT_A, RT_B},
+    [0xB1] = {IN_OR, AM_R_R, RT_A, RT_C},
+    [0xB2] = {IN_OR, AM_R_R, RT_A, RT_D},
+    [0xB3] = {IN_OR, AM_R_R, RT_A, RT_E},
+    [0xB4] = {IN_OR, AM_R_R, RT_A, RT_H},
+    [0xB5] = {IN_OR, AM_R_R, RT_A, RT_L},
+    [0xB6] = {IN_OR, AM_R_MR, RT_A, RT_HL},
+    [0xB7] = {IN_OR, AM_R_R, RT_A, RT_A},
+    [0xB8] = {IN_CP, AM_R_R, RT_A, RT_B},
+    [0xB9] = {IN_CP, AM_R_R, RT_A, RT_C},
+    [0xBA] = {IN_CP, AM_R_R, RT_A, RT_D},
+    [0xBB] = {IN_CP, AM_R_R, RT_A, RT_E},
+    [0xBC] = {IN_CP, AM_R_R, RT_A, RT_H},
+    [0xBD] = {IN_CP, AM_R_R, RT_A, RT_L},
+    [0xBE] = {IN_CP, AM_R_MR, RT_A, RT_HL},
+    [0xBF] = {IN_CP, AM_R_R, RT_A, RT_A},
+
+    [0xC0] = {IN_RET, AM_IMP, RT_NONE, RT_NONE, CT_NZ},
+    [0xC1] = {IN_POP, AM_R, RT_BC},
+    [0xC2] = {IN_JP, AM_D16, RT_NONE, RT_NONE, CT_NZ},
+    [0xC3] = {IN_JP, AM_D16},
+    [0xC4] = {IN_CALL, AM_D16, RT_NONE, RT_NONE, CT_NZ},
+    [0xC5] = {IN_PUSH, AM_R, RT_BC},
+    [0xC6] = {IN_ADD, AM_R_D8, RT_A},
+    [0xC7] = {IN_RST, AM_IMP, RT_NONE, RT_NONE, CT_NONE, 0x00},
+    [0xC8] = {IN_RET, AM_IMP, RT_NONE, RT_NONE, CT_Z},
+    [0xC9] = {IN_RET},
+    [0xCA] = {IN_JP, AM_D16, RT_NONE, RT_NONE, CT_Z},
+    [0xCB] = {IN_CB, AM_D8},
+    [0xCC] = {IN_CALL, AM_D16, RT_NONE, RT_NONE, CT_Z},
+    [0xCD] = {IN_CALL, AM_D16},
+    [0xCE] = {IN_ADC, AM_R_D8, RT_A},
+    [0xCF] = {IN_RST, AM_IMP, RT_NONE, RT_NONE, CT_NONE, 0x08},
+
+    [0xD0] = {IN_RET, AM_IMP, RT_NONE, RT_NONE, CT_NC},
+    [0xD1] = {IN_POP, AM_R, RT_DE},
+    [0xD2] = {IN_JP, AM_D16, RT_NONE, RT_NONE, CT_NC},
+    [0xD4] = {IN_CALL, AM_D16, RT_NONE, RT_NONE, CT_NC},
+    [0xD5] = {IN_PUSH, AM_R, RT_DE},
+    [0xD6] = {IN_SUB, AM_R_D8, RT_A},
+    [0xD7] = {IN_RST, AM_IMP, RT_NONE, RT_NONE, CT_NONE, 0x10},
+    [0xD8] = {IN_RET, AM_IMP, RT_NONE, RT_NONE, CT_C},
+    [0xD9] = {IN_RETI},
+    [0xDA] = {IN_JP, AM_D16, RT_NONE, RT_NONE, CT_C},
+    [0xDC] = {IN_CALL, AM_D16, RT_NONE, RT_NONE, CT_C},
+    [0xDE] = {IN_SBC, AM_R_D8, RT_A},
+    [0xDF] = {IN_RST, AM_IMP, RT_NONE, RT_NONE, CT_NONE, 0x18},
+
+    //0xEX
+    [0xE0] = {IN_LDH, AM_A8_R, RT_NONE, RT_A},
+    [0xE1] = {IN_POP, AM_R, RT_HL},
+    [0xE2] = {IN_LD, AM_MR_R, RT_C, RT_A},
+    [0xE5] = {IN_PUSH, AM_R, RT_HL},
+    [0xE6] = {IN_AND, AM_R_D8, RT_A},
+    [0xE7] = {IN_RST, AM_IMP, RT_NONE, RT_NONE, CT_NONE, 0x20},
+    [0xE8] = {IN_ADD, AM_R_D8, RT_SP},
+    [0xE9] = {IN_JP, AM_R, RT_HL},
+    [0xEA] = {IN_LD, AM_A16_R, RT_NONE, RT_A},
+    [0xEE] = {IN_XOR, AM_R_D8, RT_A},
+    [0xEF] = {IN_RST, AM_IMP, RT_NONE, RT_NONE, CT_NONE, 0x28},
+
+
+    //0xFX
+    [0xF0] = {IN_LDH, AM_R_A8, RT_A},
+    [0xF1] = {IN_POP, AM_R, RT_AF},
+    [0xF2] = {IN_LD, AM_R_MR, RT_A, RT_C},
+    [0xF3] = {IN_DI},
+    [0xF5] = {IN_PUSH, AM_R, RT_AF},
+    [0xF6] = {IN_OR, AM_R_D8, RT_A},
+    [0xF7] = {IN_RST, AM_IMP, RT_NONE, RT_NONE, CT_NONE, 0x30},
+    [0xF8] = {IN_LD, AM_HL_SPR, RT_HL, RT_SP},
+    [0xF9] = {IN_LD, AM_R_R, RT_SP, RT_HL},
+    [0xFA] = {IN_LD, AM_R_A16, RT_A},
+    [0xFB] = {IN_EI},
+    [0xFE] = {IN_CP, AM_R_D8, RT_A},
+    [0xFF] = {IN_RST, AM_IMP, RT_NONE, RT_NONE, CT_NONE, 0x38},
+};
+
+
+
+instruction *instruction_by_opcode(u8 opcode) {
+    return &instructions[opcode];
+}
+
+char *inst_lookup[] = {
+    "<NONE>",
+    "NOP",
+    "LD",
+    "INC",
+    "DEC",
+    "RLCA",
+    "ADD",
+    "RRCA",
+    "STOP",
+    "RLA",
+    "JR",
+    "RRA",
+    "DAA",
+    "CPL",
+    "SCF",
+    "CCF",
+    "HALT",
+    "ADC",
+    "SUB",
+    "SBC",
+    "AND",
+    "XOR",
+    "OR",
+    "CP",
+    "POP",
+    "JP",
+    "PUSH",
+    "RET",
+    "CB",
+    "CALL",
+    "RETI",
+    "LDH",
+    "JPHL",
+    "DI",
+    "EI",
+    "RST",
+    "IN_ERR",
+    "IN_RLC", 
+    "IN_RRC",
+    "IN_RL", 
+    "IN_RR",
+    "IN_SLA", 
+    "IN_SRA",
+    "IN_SWAP", 
+    "IN_SRL",
+    "IN_BIT", 
+    "IN_RES", 
+    "IN_SET"
+};
+
+char *inst_name(in_type t) {
+    return inst_lookup[t];
+}
+
+static char *rt_lookup[] = {
+    "<NONE>",
+    "A",
+    "F",
+    "B",
+    "C",
+    "D",
+    "E",
+    "H",
+    "L",
+    "AF",
+    "BC",
+    "DE",
+    "HL",
+    "SP",
+    "PC"
+};
+
+void inst_to_str(cpu_context *ctx, char *str) {
+    instruction *inst = ctx->cur_inst;
+    sprintf(str, "%s ", inst_name(inst->type));
+
+    switch(inst->mode) {
+        case AM_IMP:
+            return;
+
+        case AM_R_D16:
+        case AM_R_A16:
+            sprintf(str, "%s %s,$%04X", inst_name(inst->type), 
+                rt_lookup[inst->reg_1], ctx->fetched_data);
+            return;
+
+        case AM_R:
+            sprintf(str, "%s %s", inst_name(inst->type), 
+                rt_lookup[inst->reg_1]);
+            return;
+
+        case AM_R_R: 
+            sprintf(str, "%s %s,%s", inst_name(inst->type), 
+                rt_lookup[inst->reg_1], rt_lookup[inst->reg_2]);
+            return;
+
+        case AM_MR_R:
+            sprintf(str, "%s (%s),%s", inst_name(inst->type), 
+                rt_lookup[inst->reg_1], rt_lookup[inst->reg_2]);
+            return;
+
+        case AM_MR:
+            sprintf(str, "%s (%s)", inst_name(inst->type), 
+                rt_lookup[inst->reg_1]);
+            return;
+
+        case AM_R_MR:
+            sprintf(str, "%s %s,(%s)", inst_name(inst->type), 
+                rt_lookup[inst->reg_1], rt_lookup[inst->reg_2]);
+            return;
+
+        case AM_R_D8:
+        case AM_R_A8:
+            sprintf(str, "%s %s,$%02X", inst_name(inst->type), 
+                rt_lookup[inst->reg_1], ctx->fetched_data & 0xFF);
+            return;
+
+        case AM_R_HLI:
+            sprintf(str, "%s %s,(%s+)", inst_name(inst->type), 
+                rt_lookup[inst->reg_1], rt_lookup[inst->reg_2]);
+            return;
+
+        case AM_R_HLD:
+            sprintf(str, "%s %s,(%s-)", inst_name(inst->type), 
+                rt_lookup[inst->reg_1], rt_lookup[inst->reg_2]);
+            return;
+
+        case AM_HLI_R:
+            sprintf(str, "%s (%s+),%s", inst_name(inst->type), 
+                rt_lookup[inst->reg_1], rt_lookup[inst->reg_2]);
+            return;
+
+        case AM_HLD_R:
+            sprintf(str, "%s (%s-),%s", inst_name(inst->type), 
+                rt_lookup[inst->reg_1], rt_lookup[inst->reg_2]);
+            return;
+
+        case AM_A8_R:
+            sprintf(str, "%s $%02X,%s", inst_name(inst->type), 
+                bus_read(ctx->regs.pc - 1), rt_lookup[inst->reg_2]);
+
+            return;
+
+        case AM_HL_SPR:
+            sprintf(str, "%s (%s),SP+%d", inst_name(inst->type), 
+                rt_lookup[inst->reg_1], ctx->fetched_data & 0xFF);
+            return;
+
+        case AM_D8:
+            sprintf(str, "%s $%02X", inst_name(inst->type), 
+                ctx->fetched_data & 0xFF);
+            return;
+
+        case AM_D16:
+            sprintf(str, "%s $%04X", inst_name(inst->type), 
+                ctx->fetched_data);
+            return;
+
+        case AM_MR_D8:
+            sprintf(str, "%s (%s),$%02X", inst_name(inst->type), 
+                rt_lookup[inst->reg_1], ctx->fetched_data & 0xFF);
+            return;
+
+        case AM_A16_R:
+            sprintf(str, "%s ($%04X),%s", inst_name(inst->type), 
+                ctx->fetched_data, rt_lookup[inst->reg_2]);
+            return;
+
+        default:
+            fprintf(stderr, "INVALID AM: %d\n", inst->mode);
+            NO_IMPL
+    }
+}===== interrupts.c =====  
+#include <cpu.h>
+#include <stack.h>
+#include <interrupts.h>
+
+void int_handle(cpu_context *ctx, u16 address) {
+    stack_push16(ctx->regs.pc);
+    ctx->regs.pc = address;
+}
+
+bool int_check(cpu_context *ctx, u16 address, interrupt_type it) {
+    if (ctx->int_flags & it && ctx->ie_register & it) {
+        int_handle(ctx, address);
+        ctx->int_flags &= ~it;
+        ctx->halted = false;
+        ctx->int_master_enabled = false;
+
+        return true;
+    }
+
+    return false;
+}
+
+void cpu_handle_interrupts(cpu_context *ctx) {
+    if (int_check(ctx, 0x40, IT_VBLANK)) {
+
+    } else if (int_check(ctx, 0x48, IT_LCD_STAT)) {
+
+    } else if (int_check(ctx, 0x50, IT_TIMER)) {
+
+    }  else if (int_check(ctx, 0x58, IT_SERIAL)) {
+
+    }  else if (int_check(ctx, 0x60, IT_JOYPAD)) {
+
+    } 
+}
+
+===== io.c =====  
+#include <io.h>
+#include <dma.h>
+#include <lcd.h>
+#include <timer.h>
+#include <cpu.h>
+#include <gamepad.h>
+
+static char serial_data[2];
+
+u8 io_read(u16 address) {
+    if (address == 0xFF00) {
+        return gamepad_get_output();
+    }
+
+    if (address == 0xFF01) {
+        return serial_data[0];
+    }
+
+    if (address == 0xFF02) {
+        return serial_data[1];
+    }
+
+    if (BETWEEN(address, 0xFF04, 0xFF07)) {
+        return timer_read(address);
+    }
+
+    if (address == 0xFF0F) {
+        return cpu_get_int_flags();
+    }
+
+    if (BETWEEN(address, 0xFF10, 0xFF3F)) {
+        //ignore sound
+        return 0;
+    }
+
+    if (BETWEEN(address, 0xFF40, 0xFF4B)) {
+        return lcd_read(address);
+    }
+
+    printf("UNSUPPORTED bus_read(%04X)\n", address);
+    return 0;
+}
+
+void io_write(u16 address, u8 value) {
+    if (address == 0xFF00) {
+        gamepad_set_sel(value);
+        return;
+    }
+    
+    if (address == 0xFF01) {
+        serial_data[0] = value;
+        return;
+    }
+
+    if (address == 0xFF02) {
+        serial_data[1] = value;
+        return;
+    }
+
+    if (BETWEEN(address, 0xFF04, 0xFF07)) {
+        timer_write(address, value);
+        return;
+    }
+    
+    if (address == 0xFF0F) {
+        cpu_set_int_flags(value);
+        return;
+    }
+
+    if (BETWEEN(address, 0xFF10, 0xFF3F)) {
+        //ignore sound
+        return;
+    }
+
+    if (BETWEEN(address, 0xFF40, 0xFF4B)) {
+        lcd_write(address, value);
+        return;
+    }
+
+    printf("UNSUPPORTED bus_write(%04X)\n", address);
+}
+===== lcd.c =====  
+#include <lcd.h>
+#include <ppu.h>
+#include <dma.h>
+
+static lcd_context ctx;
+
+static unsigned long colors_default[4] = {0xFFFFFFFF, 0xFFAAAAAA, 0xFF555555, 0xFF000000}; 
+
+void lcd_init() {
+    ctx.lcdc = 0x91;
+    ctx.scroll_x = 0;
+    ctx.scroll_y = 0;
+    ctx.ly = 0;
+    ctx.ly_compare = 0;
+    ctx.bg_palette = 0xFC;
+    ctx.obj_palette[0] = 0xFF;
+    ctx.obj_palette[1] = 0xFF;
+    ctx.win_y = 0;
+    ctx.win_x = 0;
+
+    for (int i=0; i<4; i++) {
+        ctx.bg_colors[i] = colors_default[i];
+        ctx.sp1_colors[i] = colors_default[i];
+        ctx.sp2_colors[i] = colors_default[i];
+    }
+}
+
+lcd_context *lcd_get_context() {
+    return &ctx;
+}
+
+u8 lcd_read(u16 address) {
+    u8 offset = (address - 0xFF40);
+    u8 *p = (u8 *)&ctx;
+
+    return p[offset];
+}
+
+void update_palette(u8 palette_data, u8 pal) {
+    u32 *p_colors = ctx.bg_colors;
+
+    switch(pal) {
+        case 1:
+            p_colors = ctx.sp1_colors;
+            break;
+        case 2:
+            p_colors = ctx.sp2_colors;
+            break;
+    }
+
+    p_colors[0] = colors_default[palette_data & 0b11];
+    p_colors[1] = colors_default[(palette_data >> 2) & 0b11];
+    p_colors[2] = colors_default[(palette_data >> 4) & 0b11];
+    p_colors[3] = colors_default[(palette_data >> 6) & 0b11];
+}
+
+void lcd_write(u16 address, u8 value) {
+
+    u8 offset = (address - 0xFF40);
+    u8 *p = (u8 *)&ctx;
+    p[offset] = value;
+
+    if (offset == 6) { 
+        //0xFF46 = DMA
+        dma_start(value);
+    }
+
+    if (address == 0xFF47) {
+        update_palette(value, 0);
+    } else if (address == 0xFF48) {
+        update_palette(value & 0b11111100, 1);
+    } else if (address == 0xFF49) {
+        update_palette(value & 0b11111100, 2);
+    }
+}
+===== ppu.c =====  
+#include <ppu.h>
+#include <lcd.h>
+#include <string.h>
+#include <ppu_sm.h>
+
+void pipeline_fifo_reset();
+void pipeline_process();
+
+static ppu_context ctx;
+
+ppu_context *ppu_get_context() {
+    return &ctx;
+}
+
+void ppu_init() {
+    ctx.current_frame = 0;
+    ctx.line_ticks = 0;
+    ctx.video_buffer = malloc(YRES * XRES * sizeof(32));
+
+    ctx.pfc.line_x = 0;
+    ctx.pfc.pushed_x = 0;
+    ctx.pfc.fetch_x = 0;
+    ctx.pfc.pixel_fifo.size = 0;
+    ctx.pfc.pixel_fifo.head = ctx.pfc.pixel_fifo.tail = NULL;
+    ctx.pfc.cur_fetch_state = FS_TILE;
+
+    ctx.line_sprites = 0;
+    ctx.fetched_entry_count = 0;
+    ctx.window_line = 0;
+
+    lcd_init();
+    LCDS_MODE_SET(MODE_OAM);
+
+    memset(ctx.oam_ram, 0, sizeof(ctx.oam_ram));
+    memset(ctx.video_buffer, 0, YRES * XRES * sizeof(u32));
+}
+
+void ppu_tick() {
+    ctx.line_ticks++;
+
+    switch(LCDS_MODE) {
+    case MODE_OAM:
+        ppu_mode_oam();
+        break;
+    case MODE_XFER:
+        ppu_mode_xfer();
+        break;
+    case MODE_VBLANK:
+        ppu_mode_vblank();
+        break;
+    case MODE_HBLANK:
+        ppu_mode_hblank();
+        break;
+    }
+}
+
+
+void ppu_oam_write(u16 address, u8 value) {
+    if (address >= 0xFE00) {
+        address -= 0xFE00;
+    }
+
+    u8 *p = (u8 *)ctx.oam_ram;
+    p[address] = value;
+}
+
+u8 ppu_oam_read(u16 address) {
+    if (address >= 0xFE00) {
+        address -= 0xFE00;
+    }
+
+    u8 *p = (u8 *)ctx.oam_ram;
+    return p[address];
+}
+
+void ppu_vram_write(u16 address, u8 value) {
+    ctx.vram[address - 0x8000] = value;
+}
+
+u8 ppu_vram_read(u16 address) {
+    return ctx.vram[address - 0x8000];
+}
+
+===== ppu_pipeline.c =====  
+#include <ppu.h>
+#include <lcd.h>
+#include <bus.h>
+
+bool window_visible() {
+    return LCDC_WIN_ENABLE && lcd_get_context()->win_x >= 0 &&
+        lcd_get_context()->win_x <= 166 && lcd_get_context()->win_y >= 0 &&
+        lcd_get_context()->win_y < YRES;
+}
+
+void pixel_fifo_push(u32 value) {
+    fifo_entry *next = malloc(sizeof(fifo_entry));
+    next->next = NULL;
+    next->value = value;
+
+    if (!ppu_get_context()->pfc.pixel_fifo.head) {
+        //first entry...
+        ppu_get_context()->pfc.pixel_fifo.head = ppu_get_context()->pfc.pixel_fifo.tail = next;
+    } else {
+        ppu_get_context()->pfc.pixel_fifo.tail->next = next;
+        ppu_get_context()->pfc.pixel_fifo.tail = next;
+    }
+
+    ppu_get_context()->pfc.pixel_fifo.size++;
+}
+
+u32 pixel_fifo_pop() {
+    if (ppu_get_context()->pfc.pixel_fifo.size <= 0) {
+        fprintf(stderr, "ERR IN PIXEL FIFO!\n");
+        exit(-8);
+    }
+
+    fifo_entry *popped = ppu_get_context()->pfc.pixel_fifo.head;
+    ppu_get_context()->pfc.pixel_fifo.head = popped->next;
+    ppu_get_context()->pfc.pixel_fifo.size--;
+
+    u32 val = popped->value;
+    free(popped);
+
+    return val;
+}
+
+u32 fetch_sprite_pixels(int bit, u32 color, u8 bg_color) {
+    for (int i=0; i<ppu_get_context()->fetched_entry_count; i++) {
+        int sp_x = (ppu_get_context()->fetched_entries[i].x - 8) + 
+            ((lcd_get_context()->scroll_x % 8));
+        
+        if (sp_x + 8 < ppu_get_context()->pfc.fifo_x) {
+            //past pixel point already...
+            continue;
+        }
+
+        int offset = ppu_get_context()->pfc.fifo_x - sp_x;
+
+        if (offset < 0 || offset > 7) {
+            //out of bounds..
+            continue;
+        }
+
+        bit = (7 - offset);
+
+        if (ppu_get_context()->fetched_entries[i].f_x_flip) {
+            bit = offset;
+        }
+
+        u8 hi = !!(ppu_get_context()->pfc.fetch_entry_data[i * 2] & (1 << bit));
+        u8 lo = !!(ppu_get_context()->pfc.fetch_entry_data[(i * 2) + 1] & (1 << bit)) << 1;
+
+        bool bg_priority = ppu_get_context()->fetched_entries[i].f_bgp;
+
+        if (!(hi|lo)) {
+            //transparent
+            continue;
+        }
+
+        if (!bg_priority || bg_color == 0) {
+            color = (ppu_get_context()->fetched_entries[i].f_pn) ? 
+                lcd_get_context()->sp2_colors[hi|lo] : lcd_get_context()->sp1_colors[hi|lo];
+
+            if (hi|lo) {
+                break;
+            }
+        }
+    }
+
+    return color;
+}
+
+bool pipeline_fifo_add() {
+    if (ppu_get_context()->pfc.pixel_fifo.size > 8) {
+        //fifo is full!
+        return false;
+    }
+
+    int x = ppu_get_context()->pfc.fetch_x - (8 - (lcd_get_context()->scroll_x % 8));
+
+    for (int i=0; i<8; i++) {
+        int bit = 7 - i;
+        u8 hi = !!(ppu_get_context()->pfc.bgw_fetch_data[1] & (1 << bit));
+        u8 lo = !!(ppu_get_context()->pfc.bgw_fetch_data[2] & (1 << bit)) << 1;
+        u32 color = lcd_get_context()->bg_colors[hi | lo];
+
+        if (!LCDC_BGW_ENABLE) {
+            color = lcd_get_context()->bg_colors[0];
+        }
+
+        if (LCDC_OBJ_ENABLE) {
+            color = fetch_sprite_pixels(bit, color, hi | lo);
+        }
+
+        if (x >= 0) {
+            pixel_fifo_push(color);
+            ppu_get_context()->pfc.fifo_x++;
+        }
+    }
+
+    return true;
+}
+
+void pipeline_load_sprite_tile() {
+    oam_line_entry *le = ppu_get_context()->line_sprites;
+
+    while(le) {
+        int sp_x = (le->entry.x - 8) + (lcd_get_context()->scroll_x % 8);
+
+        if ((sp_x >= ppu_get_context()->pfc.fetch_x && sp_x < ppu_get_context()->pfc.fetch_x + 8) ||
+            ((sp_x + 8) >= ppu_get_context()->pfc.fetch_x && (sp_x + 8) < ppu_get_context()->pfc.fetch_x + 8)) {
+            //need to add entry
+            ppu_get_context()->fetched_entries[ppu_get_context()->fetched_entry_count++] = le->entry;
+        }
+
+        le = le->next;
+
+        if (!le || ppu_get_context()->fetched_entry_count >= 3) {
+            //max checking 3 sprites on pixels
+            break;
+        }
+    }
+}
+
+void pipeline_load_sprite_data(u8 offset) {
+    int cur_y = lcd_get_context()->ly;
+    u8 sprite_height = LCDC_OBJ_HEIGHT;
+
+    for (int i=0; i<ppu_get_context()->fetched_entry_count; i++) {
+        u8 ty = ((cur_y + 16) - ppu_get_context()->fetched_entries[i].y) * 2;
+
+        if (ppu_get_context()->fetched_entries[i].f_y_flip) {
+            //flipped upside down...
+            ty = ((sprite_height * 2) - 2) - ty;
+        }
+
+        u8 tile_index = ppu_get_context()->fetched_entries[i].tile;
+
+        if (sprite_height == 16) {
+            tile_index &= ~(1); //remove last bit...
+        }
+
+        ppu_get_context()->pfc.fetch_entry_data[(i * 2) + offset] = 
+            bus_read(0x8000 + (tile_index * 16) + ty + offset);
+    }
+}
+
+void pipeline_load_window_tile() {
+    if (!window_visible()) {
+        return;
+    }
+    
+    u8 window_y = lcd_get_context()->win_y;
+
+    if (ppu_get_context()->pfc.fetch_x + 7 >= lcd_get_context()->win_x &&
+            ppu_get_context()->pfc.fetch_x + 7 < lcd_get_context()->win_x + YRES + 14) {
+        if (lcd_get_context()->ly >= window_y && lcd_get_context()->ly < window_y + XRES) {
+            u8 w_tile_y = ppu_get_context()->window_line / 8;
+
+            ppu_get_context()->pfc.bgw_fetch_data[0] = bus_read(LCDC_WIN_MAP_AREA + 
+                ((ppu_get_context()->pfc.fetch_x + 7 - lcd_get_context()->win_x) / 8) +
+                (w_tile_y * 32));
+
+            if (LCDC_BGW_DATA_AREA == 0x8800) {
+                ppu_get_context()->pfc.bgw_fetch_data[0] += 128;
+            }
+        }
+    }
+}
+
+void pipeline_fetch() {
+    switch(ppu_get_context()->pfc.cur_fetch_state) {
+        case FS_TILE: {
+            ppu_get_context()->fetched_entry_count = 0;
+
+            if (LCDC_BGW_ENABLE) {
+                ppu_get_context()->pfc.bgw_fetch_data[0] = bus_read(LCDC_BG_MAP_AREA + 
+                    (ppu_get_context()->pfc.map_x / 8) + 
+                    (((ppu_get_context()->pfc.map_y / 8)) * 32));
+            
+                if (LCDC_BGW_DATA_AREA == 0x8800) {
+                    ppu_get_context()->pfc.bgw_fetch_data[0] += 128;
+                }
+
+                pipeline_load_window_tile();
+            }
+
+            if (LCDC_OBJ_ENABLE && ppu_get_context()->line_sprites) {
+                pipeline_load_sprite_tile();
+            }
+
+            ppu_get_context()->pfc.cur_fetch_state = FS_DATA0;
+            ppu_get_context()->pfc.fetch_x += 8;
+        } break;
+
+        case FS_DATA0: {
+            ppu_get_context()->pfc.bgw_fetch_data[1] = bus_read(LCDC_BGW_DATA_AREA +
+                (ppu_get_context()->pfc.bgw_fetch_data[0] * 16) + 
+                ppu_get_context()->pfc.tile_y);
+
+            pipeline_load_sprite_data(0);
+
+            ppu_get_context()->pfc.cur_fetch_state = FS_DATA1;
+        } break;
+
+        case FS_DATA1: {
+            ppu_get_context()->pfc.bgw_fetch_data[2] = bus_read(LCDC_BGW_DATA_AREA +
+                (ppu_get_context()->pfc.bgw_fetch_data[0] * 16) + 
+                ppu_get_context()->pfc.tile_y + 1);
+
+            pipeline_load_sprite_data(1);
+
+            ppu_get_context()->pfc.cur_fetch_state = FS_IDLE;
+
+        } break;
+
+        case FS_IDLE: {
+            ppu_get_context()->pfc.cur_fetch_state = FS_PUSH;
+        } break;
+
+        case FS_PUSH: {
+            if (pipeline_fifo_add()) {
+                ppu_get_context()->pfc.cur_fetch_state = FS_TILE;
+            }
+
+        } break;
+
+    }
+}
+
+void pipeline_push_pixel() {
+    if (ppu_get_context()->pfc.pixel_fifo.size > 8) {
+        u32 pixel_data = pixel_fifo_pop();
+
+        if (ppu_get_context()->pfc.line_x >= (lcd_get_context()->scroll_x % 8)) {
+            ppu_get_context()->video_buffer[ppu_get_context()->pfc.pushed_x + 
+                (lcd_get_context()->ly * XRES)] = pixel_data;
+
+            ppu_get_context()->pfc.pushed_x++;
+        }
+
+        ppu_get_context()->pfc.line_x++;
+    }
+}
+
+void pipeline_process() {
+    ppu_get_context()->pfc.map_y = (lcd_get_context()->ly + lcd_get_context()->scroll_y);
+    ppu_get_context()->pfc.map_x = (ppu_get_context()->pfc.fetch_x + lcd_get_context()->scroll_x);
+    ppu_get_context()->pfc.tile_y = ((lcd_get_context()->ly + lcd_get_context()->scroll_y) % 8) * 2;
+
+    if (!(ppu_get_context()->line_ticks & 1)) {
+        pipeline_fetch();
+    }
+
+    pipeline_push_pixel();
+}
+
+void pipeline_fifo_reset() {
+    while(ppu_get_context()->pfc.pixel_fifo.size) {
+        pixel_fifo_pop();
+    }
+
+    ppu_get_context()->pfc.pixel_fifo.head = 0;
+}===== ppu_sm.c =====  
+#include <ppu.h>
+#include <lcd.h>
+#include <cpu.h>
+#include <interrupts.h>
+#include <string.h>
+#include <cart.h>
+
+void pipeline_fifo_reset();
+void pipeline_process();
+bool window_visible();
+
+void increment_ly() {
+    if (window_visible() && lcd_get_context()->ly >= lcd_get_context()->win_y &&
+        lcd_get_context()->ly < lcd_get_context()->win_y + YRES) {
+            ppu_get_context()->window_line++;
+    }
+
+    lcd_get_context()->ly++;
+
+    if (lcd_get_context()->ly == lcd_get_context()->ly_compare) {
+        LCDS_LYC_SET(1);
+
+        if (LCDS_STAT_INT(SS_LYC)) {
+            cpu_request_interrupt(IT_LCD_STAT);
+        }
+    } else {
+        LCDS_LYC_SET(0);
+    }
+}
+
+void load_line_sprites() {
+    int cur_y = lcd_get_context()->ly;
+
+    u8 sprite_height = LCDC_OBJ_HEIGHT;
+    memset(ppu_get_context()->line_entry_array, 0, 
+        sizeof(ppu_get_context()->line_entry_array));
+
+    for (int i=0; i<40; i++) {
+        oam_entry e = ppu_get_context()->oam_ram[i];
+
+        if (!e.x) {
+            //x = 0 means not visible...
+            continue;
+        }
+
+        if (ppu_get_context()->line_sprite_count >= 10) {
+            //max 10 sprites per line...
+            break;
+        }
+
+        if (e.y <= cur_y + 16 && e.y + sprite_height > cur_y + 16) {
+            //this sprite is on the current line.
+
+            oam_line_entry *entry = &ppu_get_context()->line_entry_array[
+                ppu_get_context()->line_sprite_count++
+            ];
+
+            entry->entry = e;
+            entry->next = NULL;
+
+            if (!ppu_get_context()->line_sprites ||
+                    ppu_get_context()->line_sprites->entry.x > e.x) {
+                entry->next = ppu_get_context()->line_sprites;
+                ppu_get_context()->line_sprites = entry;
+                continue;
+            }
+
+            //do some sorting...
+
+            oam_line_entry *le = ppu_get_context()->line_sprites;
+            oam_line_entry *prev = le;
+
+            while(le) {
+                if (le->entry.x > e.x) {
+                    prev->next = entry;
+                    entry->next = le;
+                    break;
+                }
+
+                if (!le->next) {
+                    le->next = entry;
+                    break;
+                }
+
+                prev = le;
+                le = le->next;
+            }
+        }
+    }
+}
+
+void ppu_mode_oam() {
+    if (ppu_get_context()->line_ticks >= 80) {
+        LCDS_MODE_SET(MODE_XFER);
+
+        ppu_get_context()->pfc.cur_fetch_state = FS_TILE;
+        ppu_get_context()->pfc.line_x = 0;
+        ppu_get_context()->pfc.fetch_x = 0;
+        ppu_get_context()->pfc.pushed_x = 0;
+        ppu_get_context()->pfc.fifo_x = 0;
+    }
+
+    if (ppu_get_context()->line_ticks == 1) {
+        //read oam on the first tick only...
+        ppu_get_context()->line_sprites = 0;
+        ppu_get_context()->line_sprite_count = 0;
+
+        load_line_sprites();
+    }
+}
+
+void ppu_mode_xfer() {
+    pipeline_process();
+
+    if (ppu_get_context()->pfc.pushed_x >= XRES) {
+        pipeline_fifo_reset();
+
+        LCDS_MODE_SET(MODE_HBLANK);
+
+        if (LCDS_STAT_INT(SS_HBLANK)) {
+            cpu_request_interrupt(IT_LCD_STAT);
+        }
+    }
+}
+
+void ppu_mode_vblank() {
+    if (ppu_get_context()->line_ticks >= TICKS_PER_LINE) {
+        increment_ly();
+
+        if (lcd_get_context()->ly >= LINES_PER_FRAME) {
+            LCDS_MODE_SET(MODE_OAM);
+            lcd_get_context()->ly = 0;
+            ppu_get_context()->window_line = 0;
+        }
+
+        ppu_get_context()->line_ticks = 0;
+    }
+}
+
+static u32 target_frame_time = 1000 / 60;
+static long prev_frame_time = 0;
+static long start_timer = 0;
+static long frame_count = 0;
+
+void ppu_mode_hblank() {
+    if (ppu_get_context()->line_ticks >= TICKS_PER_LINE) {
+        increment_ly();
+
+        if (lcd_get_context()->ly >= YRES) {
+            LCDS_MODE_SET(MODE_VBLANK);
+
+            cpu_request_interrupt(IT_VBLANK);
+
+            if (LCDS_STAT_INT(SS_VBLANK)) {
+                cpu_request_interrupt(IT_LCD_STAT);
+            }
+
+            ppu_get_context()->current_frame++;
+
+            //calc FPS...
+            u32 end = get_ticks();
+            u32 frame_time = end - prev_frame_time;
+
+            if (frame_time < target_frame_time) {
+                delay((target_frame_time - frame_time));
+            }
+
+            if (end - start_timer >= 1000) {
+                u32 fps = frame_count;
+                start_timer = end;
+                frame_count = 0;
+
+                printf("FPS: %d\n", fps);
+
+                if (cart_need_save()) {
+                    cart_battery_save();
+                }
+            }
+
+            frame_count++;
+            prev_frame_time = get_ticks();
+
+        } else {
+            LCDS_MODE_SET(MODE_OAM);
+        }
+
+        ppu_get_context()->line_ticks = 0;
+    }
+}
+
+===== ram.c =====  
+#include <ram.h>
+
+typedef struct {
+    u8 wram[0x2000];
+    u8 hram[0x80];
+} ram_context;
+
+static ram_context ctx;
+
+u8 wram_read(u16 address) {
+    address -= 0xC000;
+
+    if (address >= 0x2000) {
+        printf("INVALID WRAM ADDR %08X\n", address + 0xC000);
+        exit(-1);
+    }
+
+    return ctx.wram[address];
+}
+
+void wram_write(u16 address, u8 value) {
+    address -= 0xC000;
+
+    ctx.wram[address] = value;
+}
+
+u8 hram_read(u16 address) {
+    address -= 0xFF80;
+
+    return ctx.hram[address];
+}
+
+void hram_write(u16 address, u8 value) {
+    address -= 0xFF80;
+
+    ctx.hram[address] = value;
+}
+===== stack.c =====  
+#include <stack.h>
+#include <cpu.h>
+#include <bus.h>
+
+/*
+    STACK
+
+    SP=0xDFFF
+
+    MEMORY:
+    0xDFF7: 00
+    0xDFF8: 00
+    0xDFF9: 00
+    0xDFFA: 00
+    0xDFFB: 00
+    0xDFFC: 00
+    0xDFFD: 00
+    0xDFFE: 00
+    0xDFFF: 00 <- SP
+
+    PUSH 0x55
+
+    SP-- = 0xDFFE
+    MEMORY[0xDFFE] = 0x55
+
+    MEMORY:
+    0xDFF7: 00
+    0xDFF8: 00
+    0xDFF9: 00
+    0xDFFA: 00
+    0xDFFB: 00
+    0xDFFC: 00
+    0xDFFD: 00
+    0xDFFE: 55 <- SP
+    0xDFFF: 00
+
+    PUSH 0x77
+
+    SP-- = 0xDFFD
+    MEMORY[0xDFFD] = 0x77
+
+    MEMORY:
+    0xDFF7: 00
+    0xDFF8: 00
+    0xDFF9: 00
+    0xDFFA: 00
+    0xDFFB: 00
+    0xDFFC: 00
+    0xDFFD: 77 <- SP
+    0xDFFE: 55
+    0xDFFF: 00
+
+    val = POP
+
+    val = MEMORY[0xDFFD] = 0x77
+    SP++ = 0xDFFE
+
+    MEMORY:
+    0xDFF7: 00
+    0xDFF8: 00
+    0xDFF9: 00
+    0xDFFA: 00
+    0xDFFB: 00
+    0xDFFC: 00
+    0xDFFD: 77 
+    0xDFFE: 55 <- SP
+    0xDFFF: 00
+
+
+    PUSH 0x88
+
+    SP-- = 0xDFFD
+    MEMORY[0xDFFD] = 0x88
+
+    MEMORY:
+    0xDFF7: 00
+    0xDFF8: 00
+    0xDFF9: 00
+    0xDFFA: 00
+    0xDFFB: 00
+    0xDFFC: 00
+    0xDFFD: 88 <- SP
+    0xDFFE: 55 
+    0xDFFF: 00
+*/
+
+void stack_push(u8 data) {
+    cpu_get_regs()->sp--;
+    bus_write(cpu_get_regs()->sp, data);
+}
+
+void stack_push16(u16 data) {
+    stack_push((data >> 8) & 0xFF);
+    stack_push(data & 0xFF);
+}
+
+u8 stack_pop() {
+    return bus_read(cpu_get_regs()->sp++);
+}
+
+u16 stack_pop16() {
+    u16 lo = stack_pop();
+    u16 hi = stack_pop();
+
+    return (hi << 8) | lo;
+}
+===== timer.c =====  
+#include <timer.h>
+#include <interrupts.h>
+
+static timer_context ctx = {0};
+
+timer_context *timer_get_context() {
+    return &ctx;
+}
+
+void timer_init() {
+    ctx.div = 0xAC00;
+}
+
+void timer_tick() {
+    u16 prev_div = ctx.div;
+
+    ctx.div++;
+
+    bool timer_update = false;
+
+    switch(ctx.tac & (0b11)) {
+        case 0b00:
+            timer_update = (prev_div & (1 << 9)) && (!(ctx.div & (1 << 9)));
+            break;
+        case 0b01:
+            timer_update = (prev_div & (1 << 3)) && (!(ctx.div & (1 << 3)));
+            break;
+        case 0b10:
+            timer_update = (prev_div & (1 << 5)) && (!(ctx.div & (1 << 5)));
+            break;
+        case 0b11:
+            timer_update = (prev_div & (1 << 7)) && (!(ctx.div & (1 << 7)));
+            break;
+    }
+
+    if (timer_update && ctx.tac & (1 << 2)) {
+        ctx.tima++;
+
+        if (ctx.tima == 0xFF) {
+            ctx.tima = ctx.tma;
+
+            cpu_request_interrupt(IT_TIMER);
+        }
+    }
+}
+
+void timer_write(u16 address, u8 value) {
+    switch(address) {
+        case 0xFF04:
+            //DIV
+            ctx.div = 0;
+            break;
+
+        case 0xFF05:
+            //TIMA
+            ctx.tima = value;
+            break;
+
+        case 0xFF06:
+            //TMA
+            ctx.tma = value;
+            break;
+
+        case 0xFF07:
+            //TAC
+            ctx.tac = value;
+            break;
+    }
+}
+
+u8 timer_read(u16 address) {
+    switch(address) {
+        case 0xFF04:
+            return ctx.div >> 8;
+        case 0xFF05:
+            return ctx.tima;
+        case 0xFF06:
+            return ctx.tma;
+        case 0xFF07:
+            return ctx.tac;
+    }
+}===== ui.c =====  
+#include <ui.h>
+#include <emu.h>
+#include <bus.h>
+#include <ppu.h>
+#include <gamepad.h>
+
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_ttf.h>
+
+SDL_Window *sdlWindow;
+SDL_Renderer *sdlRenderer;
+SDL_Texture *sdlTexture;
+SDL_Surface *screen;
+
+SDL_Window *sdlDebugWindow;
+SDL_Renderer *sdlDebugRenderer;
+SDL_Texture *sdlDebugTexture;
+SDL_Surface *debugScreen;
+
+static int scale = 4;
+
+void ui_init() {
+    
+    SDL_Init(SDL_INIT_VIDEO);
+    printf("SDL INIT\n");
+    TTF_Init();
+    printf("TTF INIT\n");
+
+    SDL_CreateWindowAndRenderer(SCREEN_WIDTH, SCREEN_HEIGHT, 0, &sdlWindow, &sdlRenderer);
+
+    screen = SDL_CreateRGBSurface(0, SCREEN_WIDTH, SCREEN_HEIGHT, 32,
+                                            0x00FF0000,
+                                            0x0000FF00,
+                                            0x000000FF,
+                                            0xFF000000);
+    sdlTexture = SDL_CreateTexture(sdlRenderer,
+                                                SDL_PIXELFORMAT_ARGB8888,
+                                                SDL_TEXTUREACCESS_STREAMING,
+                                                SCREEN_WIDTH, SCREEN_HEIGHT);
+
+    SDL_CreateWindowAndRenderer(16 * 8 * scale, 32 * 8 * scale, 0, 
+        &sdlDebugWindow, &sdlDebugRenderer);
+
+    debugScreen = SDL_CreateRGBSurface(0, (16 * 8 * scale) + (16 * scale), 
+                                            (32 * 8 * scale) + (64 * scale), 32,
+                                            0x00FF0000,
+                                            0x0000FF00,
+                                            0x000000FF,
+                                            0xFF000000);
+
+    sdlDebugTexture = SDL_CreateTexture(sdlDebugRenderer,
+                                            SDL_PIXELFORMAT_ARGB8888,
+                                            SDL_TEXTUREACCESS_STREAMING,
+                                            (16 * 8 * scale) + (16 * scale), 
+                                            (32 * 8 * scale) + (64 * scale));
+
+    int x, y;
+    SDL_GetWindowPosition(sdlWindow, &x, &y);
+    SDL_SetWindowPosition(sdlDebugWindow, x + SCREEN_WIDTH + 10, y);
+}
+
+void delay(u32 ms) {
+    SDL_Delay(ms);
+}
+
+u32 get_ticks() {
+    return SDL_GetTicks();
+}
+
+static unsigned long tile_colors[4] = {0xFFFFFFFF, 0xFFAAAAAA, 0xFF555555, 0xFF000000}; 
+
+void display_tile(SDL_Surface *surface, u16 startLocation, u16 tileNum, int x, int y) {
+    SDL_Rect rc;
+
+    for (int tileY=0; tileY<16; tileY += 2) {
+        u8 b1 = bus_read(startLocation + (tileNum * 16) + tileY);
+        u8 b2 = bus_read(startLocation + (tileNum * 16) + tileY + 1);
+
+        for (int bit=7; bit >= 0; bit--) {
+            u8 hi = !!(b1 & (1 << bit)) << 1;
+            u8 lo = !!(b2 & (1 << bit));
+
+            u8 color = hi | lo;
+
+            rc.x = x + ((7 - bit) * scale);
+            rc.y = y + (tileY / 2 * scale);
+            rc.w = scale;
+            rc.h = scale;
+
+            SDL_FillRect(surface, &rc, tile_colors[color]);
+        }
+    }
+}
+
+void update_dbg_window() {
+    int xDraw = 0;
+    int yDraw = 0;
+    int tileNum = 0;
+
+    SDL_Rect rc;
+    rc.x = 0;
+    rc.y = 0;
+    rc.w = debugScreen->w;
+    rc.h = debugScreen->h;
+    SDL_FillRect(debugScreen, &rc, 0xFF111111);
+
+    u16 addr = 0x8000;
+
+    //384 tiles, 24 x 16
+    for (int y=0; y<24; y++) {
+        for (int x=0; x<16; x++) {
+            display_tile(debugScreen, addr, tileNum, xDraw + (x * scale), yDraw + (y * scale));
+            xDraw += (8 * scale);
+            tileNum++;
+        }
+
+        yDraw += (8 * scale);
+        xDraw = 0;
+    }
+
+	SDL_UpdateTexture(sdlDebugTexture, NULL, debugScreen->pixels, debugScreen->pitch);
+	SDL_RenderClear(sdlDebugRenderer);
+	SDL_RenderCopy(sdlDebugRenderer, sdlDebugTexture, NULL, NULL);
+	SDL_RenderPresent(sdlDebugRenderer);
+}
+
+void ui_update() {
+    SDL_Rect rc;
+    rc.x = rc.y = 0;
+    rc.w = rc.h = 2048;
+
+    u32 *video_buffer = ppu_get_context()->video_buffer;
+
+    for (int line_num = 0; line_num < YRES; line_num++) {
+        for (int x = 0; x < XRES; x++) {
+            rc.x = x * scale;
+            rc.y = line_num * scale;
+            rc.w = scale;
+            rc.h = scale;
+
+            SDL_FillRect(screen, &rc, video_buffer[x + (line_num * XRES)]);
+        }
+    }
+
+    SDL_UpdateTexture(sdlTexture, NULL, screen->pixels, screen->pitch);
+    SDL_RenderClear(sdlRenderer);
+    SDL_RenderCopy(sdlRenderer, sdlTexture, NULL, NULL);
+    SDL_RenderPresent(sdlRenderer);
+
+    update_dbg_window();
+}
+
+void ui_on_key(bool down, u32 key_code) {
+
+    switch(key_code) {
+        case SDLK_z: gamepad_get_state()->b = down; break;
+        case SDLK_x: gamepad_get_state()->a = down; break;
+        case SDLK_RETURN: gamepad_get_state()->start = down; break;
+        case SDLK_TAB: gamepad_get_state()->select = down; break;
+        case SDLK_UP: gamepad_get_state()->up = down; break;
+        case SDLK_DOWN: gamepad_get_state()->down = down; break;
+        case SDLK_LEFT: gamepad_get_state()->left = down; break;
+        case SDLK_RIGHT: gamepad_get_state()->right = down; break;
+    }
+
+}
+
+void ui_handle_events() {
+    SDL_Event e;
+    while (SDL_PollEvent(&e) > 0)
+    {
+        if (e.type == SDL_KEYDOWN) {
+            ui_on_key(true, e.key.keysym.sym);
+        }
+
+        if (e.type == SDL_KEYUP) {
+            ui_on_key(false, e.key.keysym.sym);
+        }
+
+        if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_CLOSE) {
+            emu_get_context()->die = true;
+        }
+    }
+}
+
