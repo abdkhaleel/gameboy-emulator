@@ -1,179 +1,118 @@
-GB-Emu
-Cycle-Accurate Game Boy Emulator in C
 
+# GB-Emu: Cycle-Accurate Game Boy Emulator
 
+GB-Emu is a cycle-accurate Nintendo Game Boy (DMG-01) emulator written from scratch in C. It faithfully emulates the Sharp LR35902 CPU, a FIFO-based PPU pipeline, and a hardware-accurate memory bus, maintaining strict timing synchronization across the CPU, PPU, timers, and interrupts.
 
+This project focuses on hardware correctness, low-level system design, and accurate timing behavior, rather than high-level abstractions or per-game hacks.
 
+## 📌 Repository Status
 
+**Important Notice:** This repository is the final and actively maintained version of the Game Boy emulator project.
 
-GB-Emu is a cycle-accurate Nintendo Game Boy (DMG-01) emulator written from scratch in C.
-It faithfully emulates the Sharp LR35902 CPU, a FIFO-based PPU pipeline, and a hardware-accurate memory bus, with strict timing synchronization across CPU, PPU, timers, and interrupts.
+The earlier repository (`abdkhaleel/GameBoy-Emulator`) is **deprecated** and will not receive further updates. All future development, fixes, and enhancements will be published exclusively in this repository.
 
-This project focuses on hardware correctness, low-level system design, and accurate timing behavior, rather than shortcuts or high-level abstractions.
+## 🎯 Project Goals
 
-📌 Repository Status
+*   **Hardware Accuracy:** Emulate original DMG hardware behavior rather than targeting specific game compatibility.
+*   **Cycle Accuracy:** Maintain strict timing across all subsystems.
+*   **Modular Design:** Use a clean architecture that mirrors real hardware blocks.
+*   **Educational Value:** Serve as a reference for systems programming and emulator development.
 
-Important Notice
-This repository is the final and actively maintained version of the Game Boy emulator project.
+## 🚀 Features
 
-The earlier repository
-👉 https://github.com/abdkhaleel/GameBoy-Emulator
+### 🧠 Central Processing Unit (Sharp LR35902)
+*   Full Fetch–Decode–Execute pipeline.
+*   Complete instruction set implementation (Z80/8080 hybrid).
+*   Accurate flag behavior and edge case handling.
+*   Interrupt handling with correct priority and timing execution.
 
-is deprecated and will not receive further updates.
+### 🎨 Pixel Processing Unit (PPU)
+*   Cycle-accurate FIFO pixel pipeline implementation.
+*   Support for Background, Window, and Sprite rendering.
+*   OAM sprite priority sorting and pixel masking.
+*   Accurate LCD mode switching (OAM Scan, Drawing, HBlank, VBlank).
+*   Hardware-accurate STAT and VBlank interrupt generation.
 
-All future development, fixes, and enhancements are available only in this repository.
+### 🧩 Memory System
+*   Unified memory bus architecture.
+*   Proper memory mirroring and handling of forbidden regions.
+*   **Memory Bank Controller (MBC) Support:**
+    *   MBC1
+    *   MBC3 (including Real-Time Clock)
+    *   MBC5
+*   Battery-backed RAM support for save file persistence.
 
-🎯 Project Goals
+### ⏱️ Timing & Synchronization
+*   Strict synchronization between:
+    *   CPU M-Cycles
+    *   PPU T-Cycles
+    *   Timer and Divider registers
+*   Accurate timer overflow and interrupt timing.
+*   Implementation avoids frame-based shortcuts in favor of cycle-stepping.
 
-Emulate original DMG hardware behavior, not just game compatibility
+### 🔊 Audio (APU)
+*   Digital synthesis of Square Wave channels (CH1 & CH2).
+*   SDL2-based audio buffering.
+*   Frequency sweep and envelope handling.
 
-Maintain cycle accuracy across all subsystems
+### 🧵 System Architecture
+*   **Multi-threaded Design:** Separation of the Emulation Core (CPU/PPU/APU/Timers) and the UI/Rendering thread.
+*   Clean separation of hardware components.
+*   Designed to scale toward full APU and Game Boy Color (CGB) support.
 
-Use a clean, modular architecture resembling real hardware blocks
+## 🛠️ Technical Stack
 
-Serve as a learning and demonstration project for systems programming
+*   **Language:** C (C99 Standard)
+*   **Graphics & Audio:** SDL2
+*   **Platform:** Linux, Windows (via WSL)
+*   **Build System:** Make
 
-🚀 Features
-🧠 CPU (Sharp LR35902)
+## ▶️ Build Instructions
 
-Full Fetch–Decode–Execute pipeline
+### Prerequisites
+Ensure the following are installed on your system:
+*   GCC or Clang compiler
+*   Make
+*   SDL2 development libraries
 
-Complete instruction set (Z80 / 8080 hybrid)
+### Building the Project
+Run the following command in the root directory:
 
-Accurate flag behavior and edge cases
-
-Interrupt handling with correct priority and timing
-
-🎨 PPU (Graphics)
-
-Cycle-accurate FIFO pixel pipeline
-
-Background, Window, and Sprite rendering
-
-OAM sprite priority sorting and pixel masking
-
-Accurate LCD modes (OAM Scan, Drawing, HBlank, VBlank)
-
-Hardware-accurate STAT and VBlank interrupts
-
-🧩 Memory System
-
-Unified memory bus architecture
-
-Memory Bank Controller support:
-
-MBC1
-
-MBC3 (with RTC)
-
-MBC5
-
-Battery-backed RAM (save file persistence)
-
-Proper memory mirroring and forbidden regions
-
-⏱️ Timing & Synchronization
-
-Strict synchronization between:
-
-CPU M-Cycles
-
-PPU T-Cycles
-
-Timers and Divider registers
-
-Accurate timer overflow and interrupt timing
-
-No frame-based shortcuts
-
-🔊 Audio (APU)
-
-Digital synthesis of Square Wave channels (CH1 & CH2)
-
-SDL2-based audio buffering
-
-Frequency sweep and envelope handling (partial APU)
-
-🧵 Architecture
-
-Multi-threaded design
-
-Emulation Core (CPU / PPU / APU / Timers)
-
-UI & Rendering thread
-
-Clean separation of hardware components
-
-Designed to scale toward full APU and CGB support
-
-🛠️ Tech Stack
-
-Language: C (C99)
-
-Graphics & Audio: SDL2
-
-Platform: Linux, Windows (via WSL)
-
-Build System: Make
-
-📂 Project Structure (High Level)
-src/
- ├── cpu/        # LR35902 CPU core
- ├── ppu/        # FIFO-based PPU pipeline
- ├── apu/        # Audio processing unit
- ├── mmu/        # Memory bus & MBCs
- ├── timers/     # DIV/TIMA logic
- ├── interrupts/ # Interrupt controller
- └── platform/   # SDL2 rendering & audio
-
-▶️ Building & Running
-Dependencies
-
-SDL2 development libraries
-
-GCC / Clang
-
-Make
-
-Build
+```bash
 make
+```
 
-Run
+### Running the Emulator
+Execute the binary with the path to a Game Boy ROM:
+
+```bash
 ./gb-emu path/to/rom.gb
+```
 
+*Note: Save files (.sav) are created automatically for cartridges that support battery-backed RAM.*
 
-Save files (.sav) are created automatically for supported cartridges.
+## 🧪 Compatibility
 
-🧪 Tested With
+The emulator has been tested with the following titles, specifically focusing on timing correctness rather than simple boot success:
 
-Pokémon Yellow
+*   Pokémon Yellow
+*   The Legend of Zelda: Link’s Awakening
+*   Tetris
+*   Super Mario Land
 
-The Legend of Zelda: Link’s Awakening
+## 📈 Future Work
 
-Tetris
+*   Full APU implementation (Wave and Noise channels: CH3, CH4).
+*   Game Boy Color (CGB) support.
+*   Improved audio accuracy.
+*   Integrated Debugger (CPU/PPU step-through).
+*   Automated test ROM integration (Blargg, Mooneye).
 
-Super Mario Land
+## 📜 License
 
-(Testing focuses on timing correctness, not just boot success.)
+This project is released under the MIT License. Please refer to the [LICENSE](LICENSE) file for details.
 
-📈 Future Work
+## 👤 Author
 
-Full APU implementation (CH3, CH4)
-
-Game Boy Color (CGB) support
-
-Improved audio accuracy
-
-Debugger (CPU/PPU step-through)
-
-Automated test ROM integration (Blargg, Mooneye)
-
-📜 License
-
-This project is released under the MIT License.
-See the LICENSE file for details.
-
-👤 Author
-
-Abdul Khaleel
-Systems Programming | Distributed Systems | Low-level Architecture
+**Abdul Khaleel**
+*Systems Programming | Distributed Systems | Low-level Architecture*
