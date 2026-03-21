@@ -86,7 +86,7 @@ make
 Execute the binary with the path to a Game Boy ROM:
 
 ```bash
-./gb-emu path/to/rom.gb
+./emu path/to/rom.gb
 ```
 
 *Note: Save files (.sav) are created automatically for cartridges that support battery-backed RAM.*
