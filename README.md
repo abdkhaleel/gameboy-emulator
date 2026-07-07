@@ -9,7 +9,7 @@ This project focuses on hardware correctness, low-level system design, and accur
 
 **Important Notice:** This repository is the final and actively maintained version of the Game Boy emulator project.
 
-The earlier repository (`abdkhaleel/GameBoy-Emulator`) is **deprecated** and will not receive further updates. All future development, fixes, and enhancements will be published exclusively in this repository.
+The earlier repository (`abdkhaleel/GameBoy-Emulator-old`) is **deprecated** and will not receive further updates. All future development, fixes, and enhancements will be published exclusively in this repository.
 
 ## 🎯 Project Goals
 
